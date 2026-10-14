@@ -1,0 +1,2346 @@
+#!/usr/bin/env python3
+"""Synthwave now-playing screen and controller for the YouTube Music desktop app.
+
+Talks to the app's API Server plugin (search, queue, like, shuffle, repeat,
+live updates over a websocket), browses the YouTube Music library through
+ytmusicapi, draws a cava visualizer and shows album art (kitty graphics
+protocol, e.g. Ghostty). Falls back to playerctl (e.g. YouTube in Firefox)
+when the app isn't reachable.
+
+Now Playing is the master: it starts YouTube Music invisibly (the app's
+appVisible/tray options are off) and quits it when the last window closes.
+
+Keys: space play/pause, n next, p previous, l like, d dislike, s shuffle,
+r repeat, / search, b library, tab queue, c cancel loading, q quit.
+In lists: enter open/play, n play next, a add to queue, r radio, esc back.
+Mouse: everything in the header is clickable (status, like/shuffle/repeat,
+search/library/queue, artist, up next, prev/play/next), drag the time bar to
+seek, click a row to select it and again to play it, wheel scrolls lists.
+"""
+import base64
+import codecs
+import collections
+import fcntl
+import functools
+import hashlib
+import io
+import json
+import os
+import queue
+import re
+import select
+import shutil
+import sqlite3
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import threading
+import time
+import traceback
+import tty
+import unicodedata
+import urllib.error
+import urllib.request
+
+# Bottom -> top gradient for the bars (same palette as ~/.config/cava/config)
+STOPS = ("#00e5ff", "#3d5afe", "#7b2ff7", "#c724f2", "#ff2bd6", "#ff4f7b", "#ff8c42", "#ffd319")
+PINK, CYAN, PURPLE, DIM, TEXT, GOLD = "#ff2bd6", "#00e5ff", "#7b2ff7", "#6b5b8c", "#d8cff0", "#ffd319"
+SUNSET = (PINK, "#ff8c42", GOLD)
+LABEL_STOPS = (PURPLE, PINK, CYAN)
+TRACK_STOPS = (CYAN, PURPLE, PINK)
+PARTIAL = " ▁▂▃▄▅▆▇█"
+BAR_W, BAR_GAP, MARGIN = 2, 1, 2
+HEADER_ROWS, FOOTER_ROWS = 12, 2
+STATUS_ROW, INFO_ROW, TITLE_ROW, ARTIST_ROW = 1, 2, 4, 5  # header line indexes (0-based)
+PROGRESS_ROW, UPNEXT_ROW, BUTTON_ROW = 7, 8, 10
+BUTTON_BG, BUTTON_PRESSED, CHIP_BG = "#2a1840", "#6a2a90", "#1f1430"
+ART_W, ART_H, ART_MIN_COLS = 18, 9, 80  # album art size in cells, shown when the window is wide enough
+LABEL = "◢◤ NOW PLAYING ◥◣"
+
+# SGR mouse reporting: clicks, drags (button-event tracking) and the wheel
+MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+
+# Fallback when the app's API isn't reachable: prefer the app over MPRIS, then anything
+PLAYER = "YoutubeMusic,%any"
+
+API_HOST, API_PORT = "127.0.0.1", 26538
+CLIENT_ID = "nowplaying"
+CONF_DIR = os.path.expanduser("~/.config/nowplaying")
+TOKEN_FILE = os.path.join(CONF_DIR, "token")
+APP_CONF = os.path.expanduser("~/.config/YouTube Music")
+APP_COOKIES = os.path.join(APP_CONF, "Cookies")
+CACHE = os.path.expanduser("~/.cache/nowplaying")
+CAVA_CONF = os.path.join(CACHE, "cava-raw.conf")
+INSTANCES = os.path.join(CACHE, "instances")
+ERROR_LOG = os.path.join(CACHE, "error.log")
+
+# ytmusicapi (library, playlists, home, radio) and Pillow (album art) live in a
+# private venv; re-run under it if needed
+VENV_PY = os.path.expanduser("~/.local/share/nowplaying/venv/bin/python")
+try:
+    from ytmusicapi import YTMusic
+except ImportError:
+    if os.path.exists(VENV_PY) and not os.environ.get("NOWPLAYING_VENV"):
+        os.environ["NOWPLAYING_VENV"] = "1"
+        os.execv(VENV_PY, [VENV_PY] + sys.argv)
+    YTMusic = None
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+try:  # reading the app's login (its cookies are encrypted like Chromium's)
+    import secretstorage
+    from cryptography.hazmat.primitives import hashes, padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+except ImportError:
+    secretstorage = None
+
+ESC = "\x1b["
+RESET = ESC + "0m"
+
+
+# ------------------------------------------------------------------- text & color
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+@functools.lru_cache(maxsize=1024)
+def fg(rgb, bold=False):
+    if isinstance(rgb, str):
+        rgb = hex_rgb(rgb)
+    return f"{ESC}{'1;' if bold else ''}38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+@functools.lru_cache(maxsize=256)
+def bg(rgb):
+    if isinstance(rgb, str):
+        rgb = hex_rgb(rgb)
+    return f"{ESC}48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+def blend(stops, t):
+    """Colour at fraction t (0..1) along a sequence of hex stops."""
+    t = min(max(t, 0.0), 1.0) * (len(stops) - 1)
+    i = min(int(t), len(stops) - 2)
+    a, b = hex_rgb(stops[i]), hex_rgb(stops[i + 1])
+    f = t - i
+    return tuple(round(a[k] + (b[k] - a[k]) * f) for k in range(3))
+
+
+def dim(rgb, factor):
+    return tuple(round(c * factor) for c in rgb)
+
+
+@functools.lru_cache(maxsize=4096)
+def char_cells(ch):
+    """Terminal cells a character occupies: 0 for combining/format marks, 2 for wide (CJK, emoji)."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+VS16 = "\ufe0f"  # variation selector 16: the preceding character is drawn as a 2-cell emoji
+
+
+def cells(text):
+    if text.isascii():
+        return len(text)
+    width = sum(map(char_cells, text))
+    if VS16 in text:
+        width += sum(1 for a, b in zip(text, text[1:]) if b == VS16 and char_cells(a) == 1)
+    return width
+
+
+CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")  # Cc, Zl, Zp, Cs
+
+
+def sanitize(text):
+    """Drop control characters from metadata so they can't move the cursor or break the layout."""
+    return CONTROL_CHARS.sub("", str(text))
+
+
+def fit(text, width, ellipsis=True):
+    """Cut text to at most `width` terminal cells (wide characters count double)."""
+    text = sanitize(text)
+    if width <= 0:
+        return ""
+    if cells(text) <= width:
+        return text
+    limit = width - 1 if ellipsis else width
+    out, used = [], 0
+    for i, c in enumerate(text):
+        w = char_cells(c)
+        if w == 1 and text[i + 1:i + 2] == VS16:
+            w = 2
+        if used + w > limit:
+            break
+        out.append(c)
+        used += w
+    return "".join(out) + ("…" if ellipsis else " " * (width - used))
+
+
+def pad(text, width):
+    return text + " " * max(width - cells(text), 0)
+
+
+@functools.lru_cache(maxsize=64)
+def gradient_codes(length, stops, bold):
+    n = max(length - 1, 1)
+    return [fg(blend(stops, i / n), bold) for i in range(length)]
+
+
+@functools.lru_cache(maxsize=512)
+def gradient_text(text, stops, bold=True):
+    return "".join(map(str.__add__, gradient_codes(len(text), stops, bold), text)) + RESET
+
+
+@functools.lru_cache(maxsize=256)
+def track_bar(track_w, done, knob):
+    """The coloured part of the time bar (cached: it only changes when the knob moves)."""
+    bar = "".join(fg(blend(TRACK_STOPS, i / max(track_w - 1, 1)))
+                  + ("━" if i < done else knob if i == done else "─") for i in range(done + 1))
+    return bar + fg("#3a2d55") + "─" * (track_w - done - 1)
+
+
+def fmt_time(seconds):
+    if seconds is None or seconds < 0:
+        return "-:--"
+    s = int(seconds)
+    return f"{s // 3600}:{s // 60 % 60:02}:{s % 60:02}" if s >= 3600 else f"{s // 60}:{s % 60:02}"
+
+
+def runs_text(obj):
+    """Join the text of a YouTube 'runs' object ({"runs": [{"text": ...}]})."""
+    if not isinstance(obj, dict):
+        return ""
+    if "simpleText" in obj:
+        return obj["simpleText"]
+    return "".join(r.get("text", "") for r in obj.get("runs", []))
+
+
+def find_key(obj, key):
+    """Depth-first search for the first value stored under `key`."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        children = obj.values()
+    elif isinstance(obj, list):
+        children = obj
+    else:
+        return None
+    for child in children:
+        found = find_key(child, key)
+        if found is not None:
+            return found
+    return None
+
+
+def walk(obj, key):
+    """Yield every value stored under `key`, anywhere in the structure."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                yield v
+            yield from walk(v, key)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v, key)
+
+
+_logged = set()
+
+
+def log_error(context=""):
+    """Append the current exception to the error log (each distinct error once per run)."""
+    text = traceback.format_exc()
+    key = text.strip().splitlines()[-1] if text.strip() else context
+    if key in _logged:
+        return
+    _logged.add(key)
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(ERROR_LOG, "a") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {context}\n{text}\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- API
+
+class AuthError(Exception):
+    pass
+
+
+def queue_renderer(item):
+    return item.get("playlistPanelVideoRenderer") or \
+        ((item.get("playlistPanelVideoWrapperRenderer") or {}).get("primaryRenderer") or {}) \
+        .get("playlistPanelVideoRenderer")
+
+
+class Api:
+    """HTTP client for the YouTube Music app's API Server plugin."""
+
+    def __init__(self):
+        self.token = None
+        try:
+            with open(TOKEN_FILE) as f:
+                self.token = f.read().strip() or None
+        except OSError:
+            pass
+
+    def request(self, method, path, body=None, timeout=4, auth=True):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(f"http://{API_HOST}:{API_PORT}{path}", data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if auth and self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise AuthError() from e
+            raise
+
+    def authorize(self):
+        """Ask the app for a token; the app shows an Allow/Deny dialog the first time."""
+        res = self.request("POST", f"/auth/{CLIENT_ID}", timeout=300, auth=False)
+        self.token = res["accessToken"]
+        os.makedirs(CONF_DIR, exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(self.token)
+
+    def forget_token(self):
+        self.token = None
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
+
+    def port_open(self):
+        try:
+            socket.create_connection((API_HOST, API_PORT), timeout=0.5).close()
+            return True
+        except OSError:
+            return False
+
+    def search(self, query):
+        """Search through the app (used when ytmusicapi isn't available)."""
+        res = self.request("POST", "/api/v1/search", {"query": query}, timeout=10)
+        results, seen = [], set()
+        for card in walk(res, "musicCardShelfRenderer"):  # the "top result" card
+            vid = (find_key(card.get("title", {}), "watchEndpoint") or {}).get("videoId") \
+                or (find_key(card, "watchEndpoint") or {}).get("videoId")
+            if vid and vid not in seen:
+                seen.add(vid)
+                results.append({"videoId": vid, "title": runs_text(card.get("title")),
+                                "subtitle": runs_text(card.get("subtitle"))})
+        for item in walk(res, "musicResponsiveListItemRenderer"):
+            vid = (item.get("playlistItemData") or {}).get("videoId") \
+                or (find_key(item.get("overlay", {}), "watchEndpoint") or {}).get("videoId")
+            if not vid or vid in seen:
+                continue  # artists, albums and playlists have no videoId
+            cols = [runs_text(c.get("musicResponsiveListItemFlexColumnRenderer", {}).get("text"))
+                    for c in item.get("flexColumns", [])]
+            seen.add(vid)
+            results.append({"videoId": vid, "title": cols[0] if cols else "?",
+                            "subtitle": " • ".join(c for c in cols[1:] if c)})
+        return results
+
+    def queue(self):
+        """The app's queue. `index` is the position the API expects (unparseable items keep their slot)."""
+        res = self.request("GET", "/api/v1/queue")
+        items = []
+        for idx, it in enumerate((res or {}).get("items", [])):
+            r = queue_renderer(it)
+            if not r:
+                continue
+            items.append({"index": idx, "title": runs_text(r.get("title")),
+                          "artist": runs_text(r.get("shortBylineText")),
+                          "length": runs_text(r.get("lengthText")),
+                          "videoId": r.get("videoId"),
+                          "current": bool(r.get("selected"))})
+        return items
+
+    def next_song(self):
+        res = self.request("GET", "/api/v1/queue/next")
+        if not res:
+            return None
+        return {"title": res.get("title") or "", "artist": runs_text(res.get("shortBylineText"))}
+
+
+class WebSocket:
+    """Just enough of a websocket client (RFC 6455) to read the app's live updates."""
+
+    def __init__(self, host, port, path):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket handshake failed")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n")[0].split()
+        code = int(status[1]) if len(status) > 1 and status[1].isdigit() else 0
+        if code in (401, 403):
+            self.sock.close()
+            raise AuthError()
+        if code != 101:
+            self.sock.close()
+            raise ConnectionError(f"websocket handshake refused ({code})")
+        self.sock.settimeout(None)
+
+    def _exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, opcode, payload=b""):
+        mask, n = os.urandom(4), len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def messages(self):
+        """Yield text messages until the connection closes. Returns the close code."""
+        parts = []
+        while True:
+            b0, b1 = self._exact(2)
+            opcode, n = b0 & 0x0F, b1 & 0x7F
+            if n == 126:
+                n = int.from_bytes(self._exact(2), "big")
+            elif n == 127:
+                n = int.from_bytes(self._exact(8), "big")
+            mask = self._exact(4) if b1 & 0x80 else None
+            payload = self._exact(n)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 8:  # close
+                return int.from_bytes(payload[:2], "big") if len(payload) >= 2 else None
+            if opcode == 9:  # ping
+                self.send(10, payload)
+            elif opcode in (0, 1):
+                parts.append(payload)
+                if b0 & 0x80:
+                    yield b"".join(parts).decode("utf-8", "replace")
+                    parts = []
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------------- state
+
+class Cancelled(Exception):
+    pass
+
+
+class State:
+    """What's playing, fed by the app's websocket or by polling playerctl, plus queue jobs."""
+
+    def __init__(self, api):
+        self.api = api
+        self.lock = threading.RLock()
+        self.source = None          # "app", "mpris" or None
+        self.notice, self.notice_until = "", 0.0
+        self.title = self.artist = self.album = self.player = ""
+        self.video_id = self.image = None
+        self.duration = None
+        self.position, self.position_at = 0.0, time.time()
+        self.playing = False
+        self.volume, self.muted = None, False
+        self.repeat, self.shuffle, self.like = None, False, None
+        self.up_next = None
+        self.pending = None         # song the user just picked, shown until it really plays
+        self.job = None             # {"label", "done", "total"} while a list is being loaded
+        self.list_gen = 0           # bumped to cancel queue jobs
+        self.jobs = queue.Queue()
+        self.ws = None
+        self.auth_denied = False
+        self.last_launch = 0.0
+        self.on_queue_changed = None
+        self.autoplay = None        # video_id -> related videoIds, used to keep the queue going
+        self.autoplay_seed = None   # song the last top-up was built from
+        for target in (self._app_loop, self._mpris_loop, self._worker, self._ticker):
+            threading.Thread(target=target, daemon=True).start()
+
+    # -- notices ---------------------------------------------------------------
+
+    def notify(self, text, seconds=None):
+        self.notice = text
+        self.notice_until = time.time() + (seconds if seconds is not None else max(3, len(text) / 15))
+
+    def clear_notice(self, text):
+        if self.notice == text:
+            self.notice_until = 0
+
+    def current_notice(self):
+        return self.notice if time.time() < self.notice_until else ""
+
+    def elapsed(self):
+        with self.lock:
+            if self.playing:
+                return self.position + (time.time() - self.position_at)
+            return self.position
+
+    def _set_position(self, pos):
+        self.position, self.position_at = float(pos or 0), time.time()
+
+    # -- the app (websocket) -----------------------------------------------
+
+    def _app_loop(self):
+        allow = "Click Allow in the YouTube Music dialog to connect Now Playing"
+        while True:
+            if not self.api.port_open():
+                with self.lock:
+                    if self.source == "app":
+                        self.source = None
+                self._maybe_launch_app()
+                time.sleep(2)
+                continue
+            if self.auth_denied:
+                time.sleep(1)
+                continue
+            try:
+                if not self.api.token:
+                    self.notify(allow, 300)
+                    try:
+                        self.api.authorize()
+                    except AuthError:
+                        self.auth_denied = True
+                        self.notify("Connection was denied in YouTube Music. Restart Now Playing to try again",
+                                    3600)
+                        continue
+                    finally:
+                        self.clear_notice(allow)
+                ws = WebSocket(API_HOST, API_PORT, f"/api/v1/ws?token={self.api.token}")
+            except AuthError:
+                self.api.forget_token()
+                continue
+            except (OSError, ValueError, KeyError):
+                time.sleep(2)
+                continue
+            self.ws = ws
+            with self.lock:
+                self.source = "app"
+            self.clear_notice("Starting YouTube Music…")
+            threading.Thread(target=self._refresh_extras, daemon=True).start()
+            code = None
+            messages = ws.messages()
+            try:
+                while True:
+                    self._on_message(json.loads(next(messages)))
+            except StopIteration as stop:
+                code = stop.value
+            except (OSError, ConnectionError):
+                pass
+            except Exception:  # a malformed message must not kill live updates for the session
+                log_error("websocket")
+            finally:
+                ws.close()
+                self.ws = None
+                with self.lock:
+                    if self.source == "app":
+                        self.source = None
+            if code == 1008:  # token no longer accepted
+                self.api.forget_token()
+            time.sleep(1)
+
+    def invalidate_token(self):
+        """The app rejected our token: forget it and reconnect (which asks for a new one)."""
+        self.api.forget_token()
+        ws = self.ws
+        if ws:
+            ws.close()
+
+    def _maybe_launch_app(self):
+        if shutil.which("youtube-music") is None or time.time() - self.last_launch < 30:
+            return
+        if subprocess.run(["pgrep", "-x", "youtube-music"], stdout=subprocess.DEVNULL).returncode == 0:
+            return
+        self.last_launch = time.time()
+        self.notify("Starting YouTube Music…", 20)
+        subprocess.Popen(["youtube-music"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def _apply_song(self, song):
+        if not song:
+            self.title, self.artist, self.album, self.duration = "", "", "", None
+            self.video_id = self.image = None
+            return
+        self.title = song.get("title") or ""
+        self.artist = song.get("artist") or ""
+        self.album = song.get("album") or ""
+        self.duration = song.get("songDuration")
+        self.video_id = song.get("videoId")
+        self.image = song.get("imageSrc")
+        self.player = "YouTube Music"
+
+    def _on_message(self, m):
+        if not isinstance(m, dict):
+            return
+        kind = m.get("type")
+        with self.lock:
+            if kind in ("PLAYER_INFO", "VIDEO_CHANGED"):
+                self._apply_song(m.get("song"))
+            if "isPlaying" in m:
+                self.playing = bool(m["isPlaying"])
+            if "position" in m:
+                self._set_position(m["position"])
+            if "volume" in m:
+                self.volume = m["volume"]
+            if "muted" in m:
+                self.muted = bool(m["muted"])
+            if "repeat" in m:
+                self.repeat = m["repeat"]
+            if "shuffle" in m:
+                self.shuffle = bool(m["shuffle"])
+        pending = self.pending
+        if pending and self.video_id == pending["videoId"]:
+            self.pending = None
+        if kind == "VIDEO_CHANGED":
+            self.like = None
+            threading.Timer(1.0, self._refresh_extras).start()
+
+    def _refresh_extras(self):
+        """Like state and the next song: not part of the websocket updates."""
+        if self.source != "app":
+            return
+        try:
+            self.like = (self.api.request("GET", "/api/v1/like-state") or {}).get("state")
+            self.up_next = self.api.next_song()
+        except AuthError:
+            self.invalidate_token()
+        except (OSError, ValueError):
+            return
+        self._maybe_autoplay()
+
+    def _maybe_autoplay(self):
+        """Like YouTube Music's autoplay: when the last song in the queue plays, append related songs."""
+        vid = self.video_id
+        if (not self.autoplay or not vid or self.up_next or self.job or not self.jobs.empty()
+                or self.repeat in ("ALL", "ONE") or vid == self.autoplay_seed):
+            return
+        self.autoplay_seed = vid
+
+        def job(check):
+            self.job = {"label": "Autoplay: finding similar songs", "done": 0, "total": 0}
+            before = self.api.queue()
+            have = {q["videoId"] for q in before}
+            ids = [v for v in self.autoplay(vid) if v and v not in have][:25]
+            self.job["total"] = len(ids)
+            for v in ids:
+                check()
+                _, before = self._add_and_wait(v, "INSERT_AT_END", before, check, timeout=6)
+                self.job["done"] += 1
+        self.submit(job)
+
+    def _ticker(self):
+        while True:
+            time.sleep(15)
+            self._refresh_extras()
+
+    # -- playerctl fallback --------------------------------------------------
+
+    FMT = "{{status}}\t{{artist}}\t{{title}}\t{{position}}\t{{mpris:length}}\t{{playerName}}\t{{mpris:artUrl}}"
+
+    def _mpris_loop(self):
+        while True:
+            if self.source != "app":
+                try:
+                    out = subprocess.run(["playerctl", "-p", PLAYER, "metadata", "--format", self.FMT],
+                                         capture_output=True, text=True, timeout=2)
+                    p = (out.stdout.rstrip("\n").split("\t") + [""] * 7)[:7]
+                    with self.lock:
+                        if self.source == "app":
+                            pass  # the websocket connected meanwhile; it wins
+                        elif out.returncode == 0 and out.stdout.strip():
+                            self.source = "mpris"
+                            self.playing = p[0].lower() == "playing"
+                            self.artist, self.title, self.player, self.album = p[1], p[2], p[5], ""
+                            self._set_position(int(p[3]) / 1e6 if p[3].isdigit() else 0)
+                            self.duration = int(p[4]) / 1e6 if p[4].isdigit() else None
+                            self.image = p[6] if p[6].startswith("http") else None
+                            self.video_id = p[2]
+                            self.volume = self.repeat = self.like = self.up_next = None
+                            self.shuffle = False
+                        else:
+                            self.source, self.title, self.artist, self.playing = None, "", "", False
+                            self.image = self.video_id = None
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            time.sleep(0.5 if self.source == "mpris" else 1.5)
+
+    # -- simple actions ----------------------------------------------------------
+
+    def act(self, name):
+        """Run a player action in the background, via the app if connected."""
+        if name in ("like", "dislike") and self.source == "app":  # instant feedback, confirmed by the refresh
+            state = name.upper()
+            self.like = None if self.like == state else state
+        threading.Thread(target=self._act, args=(name,), daemon=True).start()
+
+    def _act(self, name):
+        if self.source != "app":
+            mpris = {"toggle": ("play-pause",), "next": ("next",), "previous": ("previous",)}
+            if name in mpris:
+                subprocess.run(["playerctl", "-p", PLAYER, *mpris[name]],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        calls = {"toggle": ("POST", "/api/v1/toggle-play", None),
+                 "next": ("POST", "/api/v1/next", None),
+                 "previous": ("POST", "/api/v1/previous", None),
+                 "like": ("POST", "/api/v1/like", None),
+                 "dislike": ("POST", "/api/v1/dislike", None),
+                 "shuffle": ("POST", "/api/v1/shuffle", None),
+                 "repeat": ("POST", "/api/v1/switch-repeat", {"iteration": 1})}
+        if name not in calls:
+            return
+        skip = name == "dislike" and self.like == "DISLIKE"  # just disliked (not undone): move on, like YouTube Music
+        song = self.video_id
+        try:
+            self.api.request(*calls[name])
+            if skip:
+                time.sleep(0.6)
+                if self.video_id == song:  # the app didn't skip by itself
+                    self.api.request(*calls["next"])
+            if name in ("like", "dislike", "shuffle"):
+                time.sleep(0.6)
+                self._refresh_extras()
+        except AuthError:
+            self.invalidate_token()
+        except (OSError, ValueError):
+            self.notify("YouTube Music didn't respond")
+
+    def seek(self, seconds):
+        """Jump to an absolute position in the current song."""
+        seconds = max(int(seconds), 0)
+        with self.lock:
+            self._set_position(seconds)
+
+        def run():
+            try:
+                if self.source == "app":
+                    self.api.request("POST", "/api/v1/seek-to", {"seconds": seconds})
+                else:
+                    subprocess.run(["playerctl", "-p", PLAYER, "position", str(seconds)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except AuthError:
+                self.invalidate_token()
+            except (OSError, ValueError):
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+    # -- queue jobs ----------------------------------------------------------------
+    # Every queue change runs on one worker thread, one job at a time, so jobs can't
+    # interleave. The app fetches each added song from YouTube asynchronously, so a
+    # job adds one song, waits until that exact song shows up in the queue, and only
+    # then continues. Starting a new list bumps list_gen, which cancels the running job.
+
+    def submit(self, job, replace=False):
+        """Queue a job (a function taking `check`, which raises Cancelled once superseded)."""
+        if replace:
+            self.list_gen += 1
+        self.jobs.put((self.list_gen, job))
+
+    def cancel(self):
+        if self.job:
+            self.list_gen += 1
+            self.notify("Stopped loading songs")
+
+    def _worker(self):
+        while True:
+            gen, job = self.jobs.get()
+
+            def check(gen=gen):
+                if gen != self.list_gen:
+                    raise Cancelled()
+            try:
+                check()
+                job(check)
+            except Cancelled:
+                pass
+            except AuthError:
+                self.invalidate_token()
+                self.notify("Reconnecting to YouTube Music…")
+            except (OSError, ValueError) as e:
+                self.notify(f"YouTube Music didn't respond ({e})")
+            except Exception:  # never let one bad job stop the worker
+                log_error("queue job")
+                self.notify(f"Something went wrong, details in {ERROR_LOG}")
+            finally:
+                self.job = None
+                self._refresh_extras()
+                if self.on_queue_changed:
+                    self.on_queue_changed()
+
+    @staticmethod
+    def _new_index(before, after, video_id, where):
+        """API index of the copy of `video_id` that appeared between two queue snapshots."""
+        count = collections.Counter(q["videoId"] for q in before)[video_id]
+        hits = [q["index"] for q in after if q["videoId"] == video_id]
+        if len(hits) <= count:
+            return None  # our song isn't there yet (the queue grew for another reason)
+        b_ids, a_ids = [q["videoId"] for q in before], [q["videoId"] for q in after]
+        pos = next((i for i in range(len(after)) if i >= len(before) or a_ids[i] != b_ids[i]), None)
+        if pos is not None and a_ids[pos] == video_id:
+            return after[pos]["index"]
+        return hits[-1] if where == "INSERT_AT_END" else hits[0]
+
+    def _add_and_wait(self, video_id, where, before, check, timeout=8.0, fast=False):
+        """Add a song; return (its API index or None, latest queue snapshot)."""
+        self.api.request("POST", "/api/v1/queue", {"videoId": video_id, "insertPosition": where})
+        # first look when the previous add showed up (the app's delay is fairly steady), then poll faster
+        start = time.time()
+        after, delay = before, min(max(getattr(self, "add_delay", 0.15) * 0.9, 0.15), 1.0)
+        if fast:
+            delay = 0.05
+        deadline = start + timeout
+        while time.time() < deadline:
+            time.sleep(delay)
+            check()
+            after = self.api.queue()
+            index = self._new_index(before, after, video_id, where)
+            if index is not None:
+                self.add_delay = time.time() - start
+                return index, after
+            delay = 0.05 if fast else 0.15 if delay > 0.15 else min(delay * 1.5, 0.6)
+        return None, after
+
+    def _jump_and_verify(self, index, video_id, check):
+        """Play the queue item at `index` and make sure that song really started."""
+        for _ in range(3):
+            check()
+            self.api.request("PATCH", "/api/v1/queue", {"index": index})
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                time.sleep(0.1)
+                check()
+                if (self.api.request("GET", "/api/v1/song") or {}).get("videoId") == video_id:
+                    return True
+            found = [q["index"] for q in self.api.queue() if q["videoId"] == video_id]
+            if not found:
+                return False
+            index = found[0]  # the queue shifted; retry at the song's new position
+        return False
+
+    def _start(self, video_id, check):
+        """Insert a song after the current one and play it (polling fast: the user is waiting)."""
+        index, _ = self._add_and_wait(video_id, "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check,
+                                      fast=True)
+        if index is None:
+            self.pending = None
+            self.notify("YouTube Music didn't add the song, try again")
+            return False
+        if not self._jump_and_verify(index, video_id, check):
+            self.pending = None
+            self.notify("YouTube Music didn't start the song, try again")
+            return False
+        return True
+
+    def set_pending(self, item):
+        """Show a picked song in the header right away, until the app actually plays it."""
+        if item and item.get("videoId"):
+            self.pending = {"videoId": item["videoId"], "title": item.get("title", ""),
+                            "artist": item.get("sub", ""), "until": time.time() + 20}
+
+    def pending_song(self):
+        pending = self.pending
+        if pending and time.time() < pending["until"] and pending["videoId"] != self.video_id:
+            return pending
+        return None
+
+    def play_now(self, video_id, title):
+        def job(check):
+            self.job = {"label": f"Starting {title}", "done": 0, "total": 1}
+            if self._start(video_id, check):
+                self.notify(f"Playing {title}")
+        self.submit(job, replace=True)
+
+    def play_list(self, label, fetch, limit=200):
+        """Replace the queue with a list of songs and play the first one.
+
+        `fetch` returns the videoIds (it may take a moment, e.g. building a radio).
+        """
+        def job(check):
+            self.job = {"label": label, "done": 0, "total": 0}
+            ids = [v for v in fetch() if v][:limit]
+            check()
+            if not ids:
+                self.notify("Nothing to play")
+                return
+            self.job["total"] = len(ids)
+            if not self._start(ids[0], check):
+                return
+            self.job["done"] = 1
+            # drop the old queue around the song that's now playing (from the end, so indexes stay valid)
+            snapshot = self.api.queue()
+            keep = next((q["index"] for q in snapshot if q["current"] and q["videoId"] == ids[0]), None)
+            if keep is not None:
+                for q in reversed(snapshot):
+                    check()
+                    if q["index"] != keep:
+                        self.api.request("DELETE", f"/api/v1/queue/{q['index']}")
+            before = self.api.queue()
+            for vid in ids[1:]:
+                check()
+                _, before = self._add_and_wait(vid, "INSERT_AT_END", before, check, timeout=6)
+                self.job["done"] += 1
+                if self.job["done"] == 2:
+                    self._refresh_extras()  # show "up next" as soon as there is one
+        self.submit(job, replace=True)
+
+    def add(self, label, fetch, where="INSERT_AT_END"):
+        """Add songs to the queue in order (after the current song for 'next')."""
+        def job(check):
+            self.job = {"label": label, "done": 0, "total": 0}
+            ids = [v for v in fetch() if v]
+            if where == "INSERT_AFTER_CURRENT_VIDEO":
+                ids = ids[::-1]  # each insert lands right after the current song
+            self.job["total"] = len(ids)
+            before = self.api.queue()
+            for vid in ids:
+                check()
+                _, before = self._add_and_wait(vid, where, before, check, timeout=6)
+                self.job["done"] += 1
+            self.notify(f"{label}: done")
+        self.submit(job)
+
+    def jump(self, index, video_id):
+        def job(check):
+            snapshot = self.api.queue()
+            if not any(q["index"] == index and q["videoId"] == video_id for q in snapshot):
+                found = [q["index"] for q in snapshot if q["videoId"] == video_id]
+                if not found:
+                    return
+                index_now = found[0]
+            else:
+                index_now = index
+            self._jump_and_verify(index_now, video_id, check)
+        self.submit(job, replace=True)
+
+    def remove(self, index, video_id):
+        def job(check):
+            snapshot = self.api.queue()
+            matches = [q["index"] for q in snapshot if q["videoId"] == video_id]
+            if not matches:
+                return
+            target = min(matches, key=lambda i: abs(i - index))  # the copy closest to where it was
+            self.api.request("DELETE", f"/api/v1/queue/{target}")
+        self.submit(job)
+
+
+# ----------------------------------------------------------------------- library
+
+def artists_text(entry):
+    return ", ".join(a["name"] for a in entry.get("artists") or [] if a.get("name"))
+
+
+def to_item(entry, default_sub=""):
+    """Normalize a ytmusicapi result (song, video, album, playlist, artist) to a list item."""
+    title = entry.get("title") or entry.get("artist") or "?"
+    album = entry.get("album")
+    album = album.get("name") if isinstance(album, dict) else None
+    kind = entry.get("resultType")
+    browse = entry.get("browseId") or ""
+    if entry.get("videoId") and kind not in ("album", "playlist", "artist"):
+        sub = " · ".join(x for x in (artists_text(entry), album, entry.get("duration")) if x)
+        return {"kind": "song", "title": title, "sub": sub, "videoId": entry["videoId"]}
+    if kind == "artist" or browse.startswith("UC"):
+        if not browse and entry.get("artists"):  # the "top result" artist keeps name/id here
+            first = entry["artists"][0]
+            title, browse = first.get("name") or title, first.get("id") or ""
+        return {"kind": "artist", "title": title, "sub": "Artist", "browseId": browse} if browse else None
+    if kind == "album" or browse.startswith("MPRE"):
+        sub = " · ".join(x for x in ("Album", artists_text(entry), str(entry.get("year") or "")) if x)
+        return {"kind": "album", "title": title, "sub": sub, "browseId": browse}
+    if entry.get("playlistId") or kind == "playlist" or browse.startswith("VL"):
+        pid = entry.get("playlistId") or browse
+        count = entry.get("count") or entry.get("itemCount")
+        sub = " · ".join(x for x in ("Playlist", entry.get("author") if isinstance(entry.get("author"), str)
+                                       else artists_text(entry) or default_sub,
+                                       f"{count} songs" if count else "") if x)
+        return {"kind": "playlist", "title": title, "sub": sub, "playlistId": pid}
+    return None
+
+
+def songs(tracks):
+    return [i for i in (to_item(t) for t in tracks or []) if i and i["kind"] == "song"]
+
+
+LOGIN_EXPIRED = "Not signed in to YouTube Music. Choose Library › Sign in"
+
+
+def friendly_error(e):
+    """Short, readable text for ytmusicapi errors (which can embed whole JSON responses)."""
+    text = str(e)
+    if "Sign in" in text or "twoColumnBrowseResultsRenderer" in text:
+        return LOGIN_EXPIRED
+    return "Couldn't load: " + fit(text.splitlines()[0] if text else type(e).__name__, 160)
+
+
+LIBRARY_CACHE = os.path.join(CACHE, "library.json")
+
+
+# ------------------------------------------------------------------ app login
+# The YouTube Music app is an Electron (Chromium) app, so its login lives in a
+# Chromium cookie store. Values are AES-128-CBC encrypted: "v11" with a password
+# kept in the GNOME keyring, "v10" with Chromium's fixed fallback password.
+
+def _cookie_key(password):
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA1(), length=16, salt=b"saltysalt", iterations=1)
+    return kdf.derive(password)
+
+
+def _keyring_passwords():
+    """Chromium "Safe Storage" passwords from the keyring, the app's own first."""
+    found = []
+    try:
+        conn = secretstorage.dbus_init()
+        for schema in ("chrome_libsecret_os_crypt_password_v2", "chrome_libsecret_os_crypt_password_v1"):
+            for item in secretstorage.search_items(conn, {"xdg:schema": schema}):
+                if item.is_locked():
+                    item.unlock()
+                app = item.get_attributes().get("application", "")
+                found.append((0 if "youtube" in app.lower() else 1, item.get_secret()))
+    except Exception:
+        log_error("keyring")
+    return [pw for _, pw in sorted(found, key=lambda x: x[0])]
+
+
+def _decrypt(blob, keys, host, strip_hash):
+    for key in keys:
+        dec = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
+        unpad = padding.PKCS7(128).unpadder()
+        try:
+            plain = unpad.update(dec.update(blob[3:]) + dec.finalize()) + unpad.finalize()
+        except ValueError:
+            continue  # wrong key
+        if strip_hash:  # newer stores prefix the value with sha256(host)
+            if plain[:32] != hashlib.sha256(host.encode()).digest():
+                continue
+            plain = plain[32:]
+        try:
+            return plain.decode()
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def app_login_headers():
+    """Request headers carrying the YouTube Music app's login, or None if it isn't signed in."""
+    if secretstorage is None or not os.path.exists(APP_COOKIES):
+        return None
+    with open(APP_COOKIES, "rb") as f:  # read a snapshot: the app keeps the file open
+        data = f.read()
+    db = sqlite3.connect(":memory:")
+    try:
+        db.deserialize(data)
+        version = int(dict(db.execute("SELECT key, value FROM meta")).get("version", 0))
+        rows = db.execute("SELECT host_key, name, value, encrypted_value, expires_utc FROM cookies "
+                          "WHERE host_key LIKE '%youtube.com'").fetchall()
+    finally:
+        db.close()
+    now = (time.time() + 11644473600) * 1e6  # Chromium counts microseconds since 1601
+    v10, v11 = [_cookie_key(b"peanuts")], None
+    cookies = {}
+    for host, name, value, blob, expires in rows:
+        if expires and expires < now:
+            continue
+        if not value and blob:
+            if blob[:3] == b"v11":
+                if v11 is None:
+                    v11 = [_cookie_key(pw) for pw in _keyring_passwords()] + [_cookie_key(b"")]
+                value = _decrypt(blob, v11, host, version >= 24)
+            elif blob[:3] == b"v10":
+                value = _decrypt(blob, v10, host, version >= 24)
+        if value:
+            cookies[name] = value
+    if "__Secure-3PAPISID" not in cookies:
+        return None
+    return {
+        "cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+        "authorization": "SAPISIDHASH 0_0",  # tells ytmusicapi to sign each request from the cookie
+        "x-goog-authuser": "0",
+        "origin": "https://music.youtube.com",
+        "x-origin": "https://music.youtube.com",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "accept": "*/*",
+        "content-type": "application/json",
+    }
+
+
+def show_app_window():
+    """Bring up the (normally hidden) app window: a second launch makes the running app show itself."""
+    if shutil.which("youtube-music") is None:
+        return "YouTube Music isn't installed"
+    subprocess.Popen(["youtube-music"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return ("Sign in inside the YouTube Music window, then close it. "
+            "Now Playing picks up the login by itself")
+
+
+class Library:
+    """YouTube Music library, home and playlists via ytmusicapi, signed in with the app's login."""
+
+    LOGIN_TTL = 600  # re-read the app's cookies this often (Google rotates some of them)
+
+    def __init__(self):
+        self._yt, self._yt_at = None, 0.0
+        self.yt_lock = threading.Lock()
+        self.logged_in = False
+        if self.available:
+            try:
+                self.logged_in = app_login_headers() is not None
+            except Exception:
+                log_error("app login")
+        self.cache_lock = threading.Lock()
+        try:
+            with open(LIBRARY_CACHE) as f:
+                self.cache = json.load(f)
+        except (OSError, ValueError):
+            self.cache = {}
+
+    def cached(self, key):
+        return self.cache.get(key) if key else None
+
+    def remember(self, key, items):
+        """Keep a loaded list (shown instantly next time, also after a restart)."""
+        if not key or self.cache.get(key) == items:
+            return
+        with self.cache_lock:
+            self.cache[key] = items
+            try:
+                os.makedirs(CACHE, exist_ok=True)
+                tmp = LIBRARY_CACHE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(self.cache, f)
+                os.replace(tmp, LIBRARY_CACHE)
+            except OSError:
+                pass
+
+    @property
+    def available(self):
+        return YTMusic is not None
+
+    def yt(self):
+        with self.yt_lock:
+            stale = time.time() - self._yt_at > self.LOGIN_TTL
+            if self._yt is None or stale or not self.logged_in:
+                try:
+                    headers = app_login_headers()
+                except Exception:
+                    log_error("app login")
+                    headers = None
+                if self._yt is None or headers or self.logged_in:
+                    self._yt = YTMusic(headers) if headers else YTMusic()
+                self.logged_in, self._yt_at = headers is not None, time.time()
+            return self._yt
+
+    def search(self, query):
+        items, last = [], None
+        for r in self.yt().search(query, limit=20):
+            item = to_item(r)
+            if not item:
+                continue
+            if r.get("category") != last:
+                last = r.get("category")
+                items.append({"kind": "header", "title": last or "Results"})
+            items.append(item)
+        return items
+
+    def home(self):
+        items = []
+        for section in self.yt().get_home(limit=8):
+            content = [i for i in (to_item(c) for c in section.get("contents") or []) if i]
+            if content:
+                items.append({"kind": "header", "title": section.get("title") or ""})
+                items += content
+        return items
+
+    def liked(self):
+        return songs(self.yt().get_liked_songs(limit=500).get("tracks"))
+
+    def playlists(self):
+        return [i for i in (to_item(p) for p in self.yt().get_library_playlists(limit=100)) if i]
+
+    def albums(self):
+        return [i for i in (to_item({**a, "resultType": "album"})
+                            for a in self.yt().get_library_albums(limit=100)) if i]
+
+    def history(self):
+        items, last = [], None
+        for t in self.yt().get_history():
+            item = to_item(t)
+            if not item or item["kind"] != "song":
+                continue
+            if t.get("played") != last:
+                last = t.get("played")
+                items.append({"kind": "header", "title": last or ""})
+            items.append(item)
+        return items
+
+    def playlist(self, playlist_id):
+        return songs(self.yt().get_playlist(playlist_id, limit=500).get("tracks"))
+
+    def album(self, browse_id):
+        album = self.yt().get_album(browse_id)
+        for t in album.get("tracks") or []:  # album tracks don't repeat the album name
+            t.setdefault("album", {"name": album.get("title")})
+        return songs(album.get("tracks"))
+
+    def artist(self, browse_id):
+        a = self.yt().get_artist(browse_id)
+        items = []
+        top = songs((a.get("songs") or {}).get("results"))
+        if top:
+            items += [{"kind": "header", "title": "Top songs"}] + top
+        for key, label in (("albums", "Albums"), ("singles", "Singles")):
+            entries = [i for i in (to_item({**e, "resultType": "album"})
+                                   for e in (a.get(key) or {}).get("results") or []) if i]
+            if entries:
+                items += [{"kind": "header", "title": label}] + entries
+        return items
+
+    def artist_by_name(self, name):
+        for r in self.yt().search(name, filter="artists", limit=3):
+            if r.get("browseId"):
+                return self.artist(r["browseId"])
+        return []
+
+    def radio(self, video_id):
+        return songs(self.yt().get_watch_playlist(videoId=video_id, radio=True, limit=50).get("tracks"))
+
+    def radio_ids(self, video_id):
+        """The song followed by its radio (just the song if the radio can't be fetched)."""
+        try:
+            related = [s["videoId"] for s in self.radio(video_id)]
+        except Exception:
+            log_error("radio")
+            related = []
+        return [video_id] + [v for v in related if v != video_id]
+
+    def tracks_of(self, item):
+        """Songs inside a playlist or album item (for 'add all')."""
+        if item["kind"] == "playlist":
+            return self.playlist(item["playlistId"])
+        if item["kind"] == "album":
+            return self.album(item["browseId"])
+        return [item] if item.get("videoId") else []
+
+
+# --------------------------------------------------------------------- album art
+
+class AlbumArt:
+    """Album art via the kitty graphics protocol (Ghostty, kitty, WezTerm)."""
+    IMAGE_ID = 7
+
+    def __init__(self):
+        term = os.environ.get("TERM", "") + " " + os.environ.get("TERM_PROGRAM", "")
+        self.enabled = Image is not None and any(t in term for t in ("ghostty", "kitty", "WezTerm"))
+        self.key = None           # (video id, url) of the art we have / are fetching
+        self.pending = None       # PNG bytes to transmit (b"" = no art for this song)
+        self.loaded = False       # an image is transmitted
+        self.placed_at = None     # (row, col) where it's placed
+        self.lock = threading.Lock()  # key and pending change together (fetch threads vs. draw)
+
+    def want(self, key, url):
+        if not self.enabled or key == self.key:
+            return
+        with self.lock:
+            self.key = key
+            if not url:
+                self.pending = b""
+                return
+        threading.Thread(target=self._fetch, args=(key, url), daemon=True).start()
+
+    def _fetch(self, key, url):
+        url = re.sub(r"=w\d+-h\d+", "=w400-h400", url)  # ask for a larger googleusercontent image
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = resp.read()
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            if "ytimg.com" in url:  # hq/sd video thumbnails are 4:3 with black bars above and below
+                box = img.convert("L").point(lambda v: 255 if v > 24 else 0).getbbox()
+                if box and box[3] - box[1] >= img.height // 2:
+                    img = img.crop((0, box[1], img.width, box[3]))
+            side = min(img.size)  # video thumbnails are 16:9: crop the middle square
+            left, top = (img.width - side) // 2, (img.height - side) // 2
+            img = img.crop((left, top, left + side, top + side)).resize((320, 320))
+            out = io.BytesIO()
+            img.save(out, "PNG")
+            png = out.getvalue()
+        except Exception:  # network and image decoding errors: just show no art
+            png = b""
+        with self.lock:
+            if key == self.key:  # drop art of a song that is no longer current
+                self.pending = png
+
+    def render(self, row, col, show):
+        """Escape sequences to (re)transmit and place the art; '' when nothing changed."""
+        out = ""
+        with self.lock:
+            png, self.pending = self.pending, None
+        if png is not None:
+            out += f"\x1b_Ga=d,d=I,i={self.IMAGE_ID},q=2\x1b\\"
+            self.loaded, self.placed_at = False, None
+            if png:
+                data = base64.b64encode(png).decode()
+                chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+                for n, chunk in enumerate(chunks):
+                    more = 1 if n < len(chunks) - 1 else 0
+                    keys = f"a=t,f=100,i={self.IMAGE_ID},q=2," if n == 0 else ""
+                    out += f"\x1b_G{keys}m={more};{chunk}\x1b\\"
+                self.loaded = True
+        if not show and self.placed_at:
+            out += f"\x1b_Ga=d,d=i,i={self.IMAGE_ID},q=2\x1b\\"  # remove the placement, keep the image
+            self.placed_at = None
+        elif show and self.loaded and self.placed_at != (row, col):
+            out += (f"{ESC}{row};{col}H\x1b_Ga=p,i={self.IMAGE_ID},p=1,c={ART_W},r={ART_H},C=1,q=2\x1b\\")
+            self.placed_at = (row, col)
+        return out
+
+    def forget_placement(self):
+        self.placed_at = None  # after a full screen clear
+
+    def clear(self):
+        return f"\x1b_Ga=d,d=I,i={self.IMAGE_ID},q=2\x1b\\" if self.enabled else ""
+
+
+# --------------------------------------------------------------------- visualizer
+
+class Cava:
+    def __init__(self, bars, max_range):
+        os.makedirs(CACHE, exist_ok=True)
+        with open(CAVA_CONF, "w") as f:
+            f.write(f"""[general]
+framerate = 60
+bars = {bars}
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = {max_range}
+bar_delimiter = 59
+frame_delimiter = 10
+channels = mono
+[smoothing]
+monstercat = 1
+""")
+        self.proc = subprocess.Popen(["cava", "-p", CAVA_CONF], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        self.fd = self.proc.stdout.fileno()
+        self.buf = b""
+
+    def latest_frame(self):
+        """Read what's available and return the newest complete frame (or None)."""
+        data = os.read(self.fd, 65536)
+        if not data:
+            return None
+        self.buf += data
+        *frames, self.buf = self.buf.split(b"\n")
+        for raw in reversed(frames):
+            vals = [int(v) for v in raw.split(b";") if v.strip().isdigit()]
+            if vals:
+                return vals
+        return None
+
+    def stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+# -------------------------------------------------------------------- instances
+
+def register_instance():
+    os.makedirs(INSTANCES, exist_ok=True)
+    open(os.path.join(INSTANCES, str(os.getpid())), "w").close()
+
+
+def last_instance_closing():
+    """Unregister this window; True if no other Now Playing window is still open."""
+    os.makedirs(INSTANCES, exist_ok=True)
+    with open(os.path.join(INSTANCES, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two windows closing at once must not both think they're last
+        try:
+            os.remove(os.path.join(INSTANCES, str(os.getpid())))
+        except OSError:
+            pass
+        others = 0
+        for name in os.listdir(INSTANCES):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/cmdline", "rb") as f:
+                    alive = b"nowplaying" in f.read()
+            except OSError:
+                alive = False
+            if alive:
+                others += 1
+            else:
+                try:
+                    os.remove(os.path.join(INSTANCES, name))  # left behind by a crash
+                except OSError:
+                    pass
+        return others == 0
+
+
+def stop_app():
+    # Only signal the main process (the oldest one): killing its helper processes
+    # too looks like a crash, and the app then gets relaunched.
+    subprocess.run(["pkill", "-TERM", "-o", "-x", "youtube-music"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ----------------------------------------------------------------------- screen
+
+UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
+DELETE, ENTER, BACKSPACE = "\x1b[3~", ("\r", "\n"), ("\x7f", "\x08")
+
+
+class Screen:
+    def __init__(self):
+        self.api = Api()
+        self.state = State(self.api)
+        self.state.on_queue_changed = self.queue_changed
+        self.lib = Library()
+        if self.lib.available:
+            self.state.autoplay = lambda vid: self.lib.radio_ids(vid)[1:]
+        self.art = AlbumArt()
+        self.cava, self.cava_dims, self.levels = None, None, []
+        self.cols, self.rows = 0, 0
+        self.resize_at = time.time() - 1  # lay out on the first loop (past the resize debounce)
+        self.stack = []             # open panel views (see panels section)
+        self.typing = False         # search box has focus
+        self.query = ""
+        self.hits = []              # clickable regions: (row, first col, last col, callback), 1-based
+        self.track = None           # time bar geometry: (row, first col, width)
+        self.drag_frac = None       # time bar position while dragging, 0..1
+        self.pressed = (None, 0.0)  # (button action, highlight-until time) for click feedback
+        self.title_key, self.title_since = None, time.time()
+        self.inbuf, self.esc_since = "", None
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.last_draw = 0.0
+        self.drawn = {}             # screen row -> (col, text) last sent, to skip unchanged rows
+        self.full_bar = "█" * BAR_W
+        self.empty_bar = " " * BAR_W
+        self.part_bars = [c * BAR_W for c in PARTIAL]
+        self.reflect_bar = "▒" * BAR_W
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "resize_at", time.time()))
+        threading.Thread(target=self.prefetch, daemon=True).start()
+
+    def prefetch(self):
+        """Load the main library lists in the background once connected, so they open instantly."""
+        if not self.lib.available:
+            return
+        while self.state.source != "app":
+            time.sleep(1)
+        jobs = [("home", self.lib.home)]
+        if self.lib.logged_in:
+            jobs += [("liked", self.lib.liked), ("playlists", self.lib.playlists)]
+        for key, loader in jobs:
+            try:
+                self.lib.remember(key, loader())
+            except Exception:  # offline or logged out: the view will show the reason when opened
+                pass
+
+    # -- layout ------------------------------------------------------------------
+
+    def layout(self):
+        self.resize_at = None
+        self.cols, self.rows = shutil.get_terminal_size()
+        self.area = max(self.rows - HEADER_ROWS - FOOTER_ROWS, 3)
+        bars_area = self.area - 1  # -1 for the horizon line
+        self.reflect_h = bars_area // 4
+        self.bar_h = max(bars_area - self.reflect_h, 1)
+        self.nbars = max((self.cols - 2 * MARGIN + BAR_GAP) // (BAR_W + BAR_GAP), 1)
+        self.row_colors = [fg(blend(STOPS, b / max(self.bar_h - 1, 1))) for b in range(self.bar_h)]
+        self.reflect_colors = [fg(dim(blend(STOPS, b / max(self.bar_h - 1, 1)),
+                                      0.45 * (1 - b / max(self.reflect_h, 1)) + 0.08))
+                               for b in range(self.reflect_h)]
+        if (self.nbars, self.bar_h) != self.cava_dims:  # only restart cava when the bars changed
+            self.start_cava()
+        self.levels = (self.levels + [0] * self.nbars)[:self.nbars]
+        top = self.bar_h * 8  # level -> cell text, per row (levels above `top` look the same as `top`)
+        self.bar_cells = [[self.full_bar if b < v >> 3 else self.part_bars[v & 7] if b == v >> 3 else self.empty_bar
+                           for v in range(top + 1)] for b in range(self.bar_h)]
+        self.reflect_cells = [[self.reflect_bar if b < v >> 3 else self.empty_bar for v in range(top + 1)]
+                              for b in range(self.reflect_h)]
+        # not ESC[2J: Ghostty's ED 2 also deletes all kitty images, data included, so i=7 could
+        # no longer be placed; home + erase-below clears the same cells and keeps the image data
+        sys.stdout.write(ESC + "H" + ESC + "J")
+        self.drawn = {}
+        self.art.forget_placement()
+
+    def start_cava(self):
+        if self.cava:
+            self.cava.stop()
+        self.cava, self.cava_dims = None, (self.nbars, self.bar_h)
+        try:
+            self.cava = Cava(self.nbars, self.bar_h * 8)
+        except OSError:
+            self.state.notify("cava isn't available, the visualizer is off")
+
+    @property
+    def art_on(self):
+        return self.art.enabled and self.cols >= ART_MIN_COLS and self.rows >= HEADER_ROWS
+
+    # -- header ------------------------------------------------------------------
+
+    def segments(self, row, x, parts, gap=2):
+        """Lay out (text, style, callback) parts from column x; register clickable ones."""
+        out = []
+        for i, (text, style, callback) in enumerate(parts):
+            if i:
+                out.append(" " * gap)
+                x += gap
+            out.append(style + text + RESET)
+            if callback:
+                self.hits.append((row, x, x + cells(text) - 1, callback))
+            x += cells(text)
+        return "".join(out), x
+
+    def header(self):
+        """Header lines as (start column, text); lines 1-9 start right of the album art."""
+        st = self.state
+        x0 = MARGIN + 1 + (ART_W + 2 if self.art_on else 0)
+        w = max(self.cols - x0 + 1 - MARGIN, 10)
+        app = st.source == "app"
+        # rows beside the art start right of it, so even blank ones never erase the image
+        lines = [(x0 if STATUS_ROW <= i < STATUS_ROW + ART_H else 1, "") for i in range(HEADER_ROWS)]
+
+        pending = st.pending_song()
+        title, artist_text = (pending["title"], pending["artist"]) if pending else (st.title, st.artist)
+
+        # status line: label and a clickable play state
+        if pending:
+            status = ("◌ LOADING", fg(GOLD, True), None)
+        elif not st.title:
+            status = ("■ IDLE", fg(DIM), None)
+        elif st.playing:
+            status = ("▶ PLAYING", fg(CYAN, True), lambda: self.press("toggle"))
+        else:
+            status = ("❚❚ PAUSED", fg(PINK, True), lambda: self.press("toggle"))
+        gap = max(w - cells(LABEL) - cells(status[0]), 1)
+        text, _ = self.segments(STATUS_ROW + 1, x0 + cells(LABEL) + gap, [status])
+        lines[STATUS_ROW] = (x0, gradient_text(LABEL, LABEL_STOPS) + " " * gap + text)
+
+        # info line: notice / loading progress / clickable badges on the left, navigation on the right
+        nav = [(" SEARCH ", bg(CHIP_BG) + fg(PINK, True), self.open_search),
+               (" LIBRARY ", bg(CHIP_BG) + fg(PINK, True), self.open_library),
+               (" QUEUE ", bg(CHIP_BG) + fg(PINK, True), self.open_queue)] if app else []
+        nav_w = sum(cells(t) for t, _, _ in nav) + 2 * max(len(nav) - 1, 0)
+        left_w = w - nav_w - 2 if nav and w - nav_w - 2 >= 20 else w
+        if left_w == w:
+            nav, nav_w = [], 0
+        notice = st.current_notice()
+        if notice:
+            left = [(fit(notice, left_w), fg(GOLD), None)]
+        elif st.job:
+            job = st.job
+            count = f" {job['done']}/{job['total']}" if job["total"] > 1 else ""
+            room = left_w - 11 - 2 - cells(count)  # keep the n/total visible, shorten the label
+            label = "⟳ " + (fit(job["label"], room) if room >= 4 else "") + count
+            left = [(label, fg(GOLD), None), ("✕ CANCEL", fg(PINK, True), st.cancel)]
+        else:
+            left = self.badges(left_w)
+        left_text, x = self.segments(INFO_ROW + 1, x0, left, gap=3)
+        right_text = ""
+        if nav:
+            right_text, _ = self.segments(INFO_ROW + 1, x0 + w - nav_w, nav)
+            left_text += " " * max(x0 + w - nav_w - x, 1)
+        lines[INFO_ROW] = (x0, left_text + right_text)
+
+        if not title:
+            lines[TITLE_ROW] = (x0, gradient_text(fit("Nothing playing", w), SUNSET))
+            hint = "Press / to search or b for your library" if app else "Start a song in YouTube Music"
+            lines[ARTIST_ROW] = (x0, fg(DIM) + fit(hint, w) + RESET)
+            self.track = None
+        else:
+            lines[TITLE_ROW] = (x0, gradient_text(self.marquee(title, w), SUNSET))
+            artist = fit(artist_text, w)
+            open_artist = ((lambda: self.open_artist(st.artist)) if app and self.lib.available and not pending
+                           else None)
+            text, _ = self.segments(ARTIST_ROW + 1, x0, [(artist, fg(CYAN), open_artist)])
+            lines[ARTIST_ROW] = (x0, text)
+            if pending:
+                self.track = None
+            else:
+                lines[PROGRESS_ROW] = (x0, self.progress_bar(x0, w))
+        if st.up_next and st.title:
+            label = "UP NEXT  "
+            nxt = st.up_next["title"] + (f"  ·  {st.up_next['artist']}" if st.up_next["artist"] else "")
+            text, _ = self.segments(UPNEXT_ROW + 1, x0, [(label, fg(PURPLE, True), lambda: self.press("next")),
+                                                         (fit(nxt, w - cells(label)), fg(TEXT),
+                                                          lambda: self.press("next"))], gap=0)
+            lines[UPNEXT_ROW] = (x0, text)
+        lines[BUTTON_ROW] = (1, self.buttons())
+        return lines
+
+    def badges(self, w):
+        st = self.state
+        if st.source != "app":
+            src = f"via {st.player}" if st.source == "mpris" and st.player else "not connected to YouTube Music"
+            return [(fit(src, w), fg(DIM), None)]
+        liked, disliked = st.like == "LIKE", st.like == "DISLIKE"
+        parts = [("▲ LIKED" if liked else "△ LIKE", fg(PINK, True) if liked else fg(DIM), lambda: st.act("like")),
+                 ("▼ DISLIKED" if disliked else "▽ DISLIKE", fg(CYAN, True) if disliked else fg(DIM),
+                  lambda: st.act("dislike"))]
+        parts.append(("⤨ SHUFFLE", fg(CYAN, True) if st.shuffle else fg(DIM), lambda: st.act("shuffle")))
+        repeat = {"ALL": "↻ REPEAT ALL", "ONE": "↻ REPEAT ONE"}.get(st.repeat, "↻ REPEAT")
+        parts.append((repeat, fg(PURPLE, True) if st.repeat in ("ALL", "ONE") else fg(DIM),
+                      lambda: st.act("repeat")))
+        if st.muted:
+            parts.append(("MUTED", fg(DIM), None))
+        if sum(cells(t) for t, _, _ in parts) + 3 * (len(parts) - 1) > w:  # tight: icons only
+            parts = [(t.replace(" DISLIKED", "").replace(" DISLIKE", "").replace(" LIKED", "").replace(" LIKE", "")
+                      .replace(" SHUFFLE", "")
+                      .replace(" REPEAT", ""), style, cb) for t, style, cb in parts]
+        while parts and sum(cells(t) for t, _, _ in parts) + 3 * (len(parts) - 1) > w:
+            parts.pop()
+        return parts
+
+    def marquee(self, title, w):
+        """Long titles scroll slowly (after a short pause) instead of being cut off."""
+        title = sanitize(title)
+        if title != self.title_key:
+            self.title_key, self.title_since = title, time.time()
+        if cells(title) <= w:
+            return title
+        loop = title + "    ✦    "
+        scroll = len(loop) / 4  # seconds to scroll one full loop at 4 characters per second
+        t = (time.time() - self.title_since) % (2.5 + scroll)  # pause 2.5 s at the start of every loop
+        offset = int(max(t - 2.5, 0) * 4) % len(loop)
+        return fit((loop + loop)[offset:], w, ellipsis=False)
+
+    def progress_bar(self, x0, w):
+        st = self.state
+        pos, length = st.elapsed(), st.duration
+        if length:
+            pos = min(pos, length)
+        if self.drag_frac is not None and length:
+            pos = self.drag_frac * length
+        left, right = fmt_time(pos), fmt_time(length)
+        track_w = max(w - len(left) - len(right) - 2, 4)
+        frac = min(pos / length, 1.0) if length else 0.0
+        done = round(frac * (track_w - 1))
+        self.track = (PROGRESS_ROW + 1, x0 + len(left) + 1, track_w) if length else None
+        knob = "◆" if self.drag_frac is not None else "●"
+        return fg(CYAN) + left + " " + track_bar(track_w, done, knob) + " " + fg(PINK) + right + RESET
+
+    def buttons(self):
+        """Centered prev / play-pause / next buttons; registers their click regions."""
+        play = ("❚❚  PAUSE", "toggle") if self.state.playing else ("▶  PLAY", "toggle")
+        specs = [("◀◀  PREV", "previous"), play, ("NEXT  ▶▶", "next")]
+        labels = [f"   {text}   " for text, _ in specs]
+        gap = 3
+        total = sum(cells(lb) for lb in labels) + gap * (len(labels) - 1)
+        if total > self.cols:  # narrow window: drop the padding
+            labels = [f" {text} " for text, _ in specs]
+            gap = 1
+            total = sum(cells(lb) for lb in labels) + gap * (len(labels) - 1)
+        col = max((self.cols - total) // 2, 0) + 1  # 1-based screen column
+        row = BUTTON_ROW + 1
+        held, until = self.pressed
+        out = " " * (col - 1)
+        for (text, action), lb in zip(specs, labels):
+            down = held == action and time.time() < until
+            out += bg(BUTTON_PRESSED if down else BUTTON_BG) + fg(PINK if action != "toggle" else CYAN, True)
+            out += lb + RESET + (" " * gap if action != "next" else "")
+            self.hits.append((row, col, col + cells(lb) - 1, lambda a=action: self.press(a)))
+            col += cells(lb) + gap
+        return out
+
+    def press(self, action):
+        self.pressed = (action, time.time() + 0.15)
+        self.state.act(action)
+
+    # -- visualizer --------------------------------------------------------------
+
+    def bars(self):
+        pad_ = " " * MARGIN
+        top = self.bar_h * 8
+        vals = [min(v, top) for v in (self.levels + [0] * self.nbars)[:self.nbars]]
+        gap = " " * BAR_GAP
+        lines = []
+        for b in range(self.bar_h - 1, -1, -1):  # top row first
+            row = gap.join(map(self.bar_cells[b].__getitem__, vals))
+            lines.append((1, pad_ + self.row_colors[b] + row + RESET))
+        lines.append((1, fg(PINK, True) + "━" * self.cols + RESET))  # horizon
+        for b in range(self.reflect_h):  # mirrored, fading reflection
+            row = gap.join(map(self.reflect_cells[b].__getitem__, vals))
+            lines.append((1, pad_ + self.reflect_colors[b] + row + RESET))
+        for i in range(len(lines)):  # clicking anywhere on the visualizer plays/pauses
+            self.hits.append((HEADER_ROWS + i + 1, 1, self.cols, lambda: self.press("toggle")))
+        return lines
+
+    # -- panels: search, queue and library ------------------------------------
+    # An open panel is a stack of views; esc/backspace goes back one level.
+    # A view is a dict: kind ("search", "queue" or "list"), title, items, msg,
+    # sel, scroll, gen and tracklist (True when Enter should play the whole list
+    # from the chosen song). Items are dicts with a "kind": header, menu, action,
+    # song, album, playlist, artist or queued.
+
+    @property
+    def view(self):
+        return self.stack[-1] if self.stack else None
+
+    def push(self, kind, title, loader=None, tracklist=False, items=None, cache_key=None):
+        v = {"kind": kind, "title": title, "items": items or [], "msg": "Loading…" if loader else "",
+             "sel": 0, "scroll": 0, "gen": 0, "tracklist": tracklist}
+        self.stack.append(v)
+        self.typing = False
+        if items:
+            self.select(v, 0, 1)
+        if loader:
+            self.load(v, loader, cache_key=cache_key)
+        return v
+
+    def load(self, v, loader, select_current=False, keep_sel=False, cache_key=None):
+        """Fill a view in the background; a remembered copy of the list shows instantly meanwhile."""
+        v["gen"] += 1
+        gen = v["gen"]
+        cached = self.lib.cached(cache_key)
+        if cached and not v["items"]:
+            probe = {"items": cached, "sel": 0}
+            self.select(probe, 0, 1)
+            v.update(items=cached, sel=probe["sel"], msg="")
+            keep_sel = True  # the refresh must not move a selection the user already made
+
+        def work():
+            try:
+                items = loader()
+            except Exception as e:  # ytmusicapi raises many kinds of errors; show them, don't crash
+                if gen == v["gen"]:
+                    if cached:
+                        self.state.notify(friendly_error(e))  # keep showing the remembered list
+                    else:
+                        v["msg"] = friendly_error(e)
+                return
+            if gen != v["gen"]:
+                return  # a newer load for this view finished first
+            if cache_key and items:
+                self.lib.remember(cache_key, items)
+            if cached and items == cached:
+                return  # nothing changed since last time
+            if not items and self.lib.logged_in and cache_key in ("playlists", "liked"):
+                msg = LOGIN_EXPIRED  # every account has Liked Music, so empty means logged out
+            else:
+                msg = "" if items else "Nothing here"
+            if select_current:
+                start = next((i for i, it in enumerate(items) if it.get("current")), 0)
+            elif keep_sel:
+                start = min(v["sel"], max(len(items) - 1, 0))
+            else:
+                start = 0
+            probe = {"items": items, "sel": start}
+            self.select(probe, start, 1)
+            v.update(items=items, sel=probe["sel"], msg=msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def select(v, index, step):
+        """Move the selection to `index`, skipping section headers in direction `step`."""
+        items = v["items"]
+        if not items:
+            v["sel"] = 0
+            return
+        index = min(max(index, 0), len(items) - 1)
+        i = index
+        while 0 <= i < len(items) and items[i]["kind"] == "header":
+            i += step
+        if not 0 <= i < len(items):  # ran off the end: look the other way
+            i = index
+            while 0 <= i < len(items) and items[i]["kind"] == "header":
+                i -= step
+        v["sel"] = min(max(i, 0), len(items) - 1)
+
+    def needs_app(self, what):
+        if self.state.source == "app":
+            return False
+        self.state.notify(f"{what} needs the YouTube Music app (API Server plugin)")
+        return True
+
+    def open_search(self):
+        if self.needs_app("Search"):
+            return
+        self.stack = []
+        self.push("search", "Search")
+        self.typing, self.query = True, ""
+
+    def run_search(self):
+        q = self.query.strip()
+        v = self.view
+        if not q or not v:
+            return
+        self.typing, v["items"], v["sel"], v["scroll"] = False, [], 0, 0
+        v["msg"] = "Searching…"
+        loader = (lambda: self.lib.search(q)) if self.lib.available else (
+            lambda: [{"kind": "song", "title": r["title"], "sub": r["subtitle"], "videoId": r["videoId"]}
+                     for r in self.api.search(q)])
+        self.load(v, loader)
+
+    def open_queue(self):
+        if self.needs_app("The queue"):
+            return
+        if self.view and self.view["kind"] == "queue":
+            self.stack = []  # the QUEUE chip / tab toggles it
+            return
+        self.stack = []
+        v = self.push("queue", "Queue")
+        v["msg"] = "Loading queue…"
+        self.reload_queue(select_current=True)
+
+    def queue_loader(self):
+        return [{"kind": "queued", "title": q["title"],
+                 "sub": q["artist"] + (f"  {q['length']}" if q["length"] else ""),
+                 "index": q["index"], "videoId": q["videoId"], "current": q["current"]}
+                for q in self.api.queue()]
+
+    def reload_queue(self, select_current=False):
+        v = self.view
+        if v and v["kind"] == "queue":
+            self.load(v, self.queue_loader, select_current=select_current, keep_sel=not select_current)
+
+    def queue_changed(self):
+        """Called by the queue worker after every job."""
+        self.reload_queue()
+
+    def open_library(self):
+        if self.needs_app("The library"):
+            return
+        if not self.lib.available:
+            self.state.notify("The library needs ytmusicapi (~/.local/share/nowplaying/venv)")
+            return
+        login = "" if self.lib.logged_in else "  (needs login)"
+        menu = [
+            {"kind": "menu", "title": "Home", "sub": "recommended for you", "loader": self.lib.home,
+             "cache": "home"},
+            {"kind": "menu", "title": "Liked songs", "sub": login, "loader": self.lib.liked, "tracklist": True,
+             "cache": "liked"},
+            {"kind": "menu", "title": "Your playlists", "sub": login, "loader": self.lib.playlists,
+             "cache": "playlists"},
+            {"kind": "menu", "title": "Your albums", "sub": login, "loader": self.lib.albums, "cache": "albums"},
+            {"kind": "menu", "title": "Recently played", "sub": login, "loader": self.lib.history,
+             "tracklist": True, "cache": "history"},
+            {"kind": "action", "title": "Switch account" if self.lib.logged_in else "Sign in",
+             "sub": "opens the YouTube Music window", "run": show_app_window},
+        ]
+        self.stack = []
+        self.push("list", "Library", items=menu)
+
+    def open_artist(self, name):
+        name = name.split(",")[0].split(" & ")[0].strip()
+        if not name or self.needs_app("The library") or not self.lib.available:
+            return
+        self.stack = []
+        self.push("list", name, lambda: self.lib.artist_by_name(name), tracklist=True,
+                  cache_key=f"artist-name:{name}")
+
+    def back(self):
+        if self.stack:
+            self.stack.pop()
+        self.typing = False
+
+    @staticmethod
+    def song_ids(items, from_index):
+        """videoIds of the songs in a list, starting at the given item."""
+        return [it["videoId"] for it in items[from_index:] if it["kind"] == "song"]
+
+    def activate(self, index):
+        """Enter / second click: open containers, play songs."""
+        v = self.view
+        items = v["items"]
+        if not 0 <= index < len(items):
+            return
+        item, lib, st = items[index], self.lib, self.state
+        kind = item["kind"]
+        if kind == "action":
+            st.notify("Working…")
+
+            def work():
+                try:
+                    st.notify(item["run"]())
+                except Exception as e:  # see load()
+                    st.notify(friendly_error(e))
+            threading.Thread(target=work, daemon=True).start()
+        elif kind == "menu":
+            self.push("list", item["title"], item["loader"], tracklist=item.get("tracklist", False),
+                      cache_key=item.get("cache"))
+        elif kind == "playlist":
+            self.push("list", item["title"], lambda: lib.playlist(item["playlistId"]), tracklist=True,
+                      cache_key=f"playlist:{item['playlistId']}")
+        elif kind == "album":
+            self.push("list", item["title"], lambda: lib.album(item["browseId"]), tracklist=True,
+                      cache_key=f"album:{item['browseId']}")
+        elif kind == "artist":
+            self.push("list", item["title"], lambda: lib.artist(item["browseId"]), tracklist=True,
+                      cache_key=f"artist:{item['browseId']}")
+        elif kind == "queued":
+            st.jump(item["index"], item["videoId"])
+        elif kind == "song":
+            st.set_pending(item)
+            if v["tracklist"]:
+                ids = self.song_ids(items, index)
+                label = f"Playing {item['title']}" + (f" + {len(ids) - 1} more" if len(ids) > 1 else "")
+                st.play_list(label, lambda: ids)
+            elif lib.available:  # a lone song starts a radio, like YouTube Music does
+                st.play_list(f"Playing {item['title']} + similar songs",
+                             lambda: lib.radio_ids(item["videoId"]))
+            else:
+                st.play_now(item["videoId"], item["title"])
+            self.stack = []
+
+    def add_to_queue(self, item, how):
+        """'n' (play next) / 'a' (add to end) on a song, album or playlist."""
+        where = "INSERT_AFTER_CURRENT_VIDEO" if how == "next" else "INSERT_AT_END"
+        if item.get("videoId") and item["kind"] in ("song", "queued"):
+            label = ("Up next: " if how == "next" else "Added: ") + item["title"]
+            self.state.add(label, lambda: [item["videoId"]], where)
+        elif item["kind"] in ("album", "playlist") and self.lib.available:
+            self.state.add(f"Adding {item['title']}",
+                           lambda: [s["videoId"] for s in self.lib.tracks_of(item)], where)
+
+    def start_radio(self, item):
+        if not item.get("videoId") or not self.lib.available:
+            return
+        self.state.set_pending(item)
+        self.state.play_list(f"Radio from {item['title']}",
+                             lambda: [s["videoId"] for s in self.lib.radio(item["videoId"])])
+        self.stack = []
+
+    def hint(self, v):
+        if v["kind"] == "search" and self.typing:
+            return "type to search · enter search · esc close"
+        items = v["items"]
+        item = items[v["sel"]] if 0 <= v["sel"] < len(items) else {}
+        kind = item.get("kind")
+        back = "esc back" if len(self.stack) > 1 else "esc close"
+        radio = " · r radio" if self.lib.available else ""
+        if kind == "queued":
+            return f"enter play this song · del remove{radio} · esc close"
+        if kind == "song":
+            play = "enter play from here" if v["tracklist"] else "enter play now"
+            return f"{play} · n play next · a add to queue{radio} · {back}"
+        if kind in ("album", "playlist"):
+            return f"enter open · a add all to queue · {back}"
+        if kind in ("artist", "menu"):
+            return f"enter open · {back}"
+        if kind == "action":
+            return f"enter run · {back}"
+        return back
+
+    def panel_lines(self):
+        v = self.view
+        pad_ = " " * MARGIN
+        w = self.cols - 2 * MARGIN
+        h = self.area
+        title_row = HEADER_ROWS + 1
+        right = []
+        if len(self.stack) > 1:
+            right.append((" ◀ BACK ", bg(CHIP_BG) + fg(CYAN, True), self.back))
+        right.append((" ✕ CLOSE ", bg(CHIP_BG) + fg(PINK, True), lambda: setattr(self, "stack", [])))
+        right_w = sum(cells(t) for t, _, _ in right) + 2 * (len(right) - 1)
+        if v["kind"] == "search":
+            cursor = fg(PINK) + "▏" if self.typing else ""
+            query = fit(self.query, w - right_w - 12)
+            left = fg(CYAN, True) + "SEARCH  " + RESET + fg(TEXT) + query + cursor + RESET
+            left_w = 8 + cells(query) + (1 if self.typing else 0)
+            self.hits.append((title_row, MARGIN + 1, MARGIN + w - right_w - 1,
+                              lambda: setattr(self, "typing", True)))
+        else:
+            crumbs = " › ".join(s["title"] for s in self.stack)
+            count = sum(1 for it in v["items"] if it["kind"] != "header")
+            count_text = f"  {count} items" if count else ""
+            crumbs = fit(crumbs.upper(), w - right_w - cells(count_text) - 2)
+            left = fg(CYAN, True) + crumbs + RESET + fg(DIM) + count_text + RESET
+            left_w = cells(crumbs) + cells(count_text)
+        right_text, _ = self.segments(title_row, MARGIN + 1 + w - right_w, right)
+        lines = [(1, pad_ + left + " " * max(w - right_w - left_w, 1) + right_text),
+                 (1, pad_ + fg("#3a2d55") + "─" * w + RESET)]
+        items = v["items"]
+        list_h = max(h - 4, 1)
+        if v["msg"] and not items:
+            lines.append((1, pad_ + fg(DIM) + fit(v["msg"], w) + RESET))
+        if items:
+            sel = v["sel"] = min(max(v["sel"], 0), len(items) - 1)
+            if sel < v["scroll"]:
+                v["scroll"] = max(sel - 1, 0) if sel and items[sel - 1]["kind"] == "header" else sel
+            elif sel >= v["scroll"] + list_h:
+                v["scroll"] = sel - list_h + 1
+            for i in range(v["scroll"], min(v["scroll"] + list_h, len(items))):
+                it = items[i]
+                if it["kind"] == "header":
+                    lines.append((1, pad_ + fg(PURPLE, True) + fit(it["title"].upper(), w) + RESET))
+                    continue
+                selected = i == sel and not self.typing
+                current = it.get("current")
+                arrow = "  ›" if it["kind"] in ("menu", "album", "playlist", "artist") else ""
+                mark = "▶ " if selected else ("♪ " if current else "  ")
+                sub = sanitize(it.get("sub", ""))
+                title_w = max(min(cells(it["title"]), max(w // 2, w - cells(sub) - 6)), 4)
+                text = fit(it["title"], title_w) + arrow
+                sub_text = fit(sub, w - cells(mark) - cells(text) - 2)
+                body = mark + text + "  " + sub_text
+                if selected:
+                    row = (bg("#2a1840") + fg(PINK, True) + mark + text + "  " + fg(CYAN) + sub_text
+                           + " " * max(w - cells(body), 0))
+                elif current:
+                    row = fg(CYAN, True) + mark + text + "  " + fg(DIM) + sub_text
+                else:
+                    row = fg(TEXT) + mark + text + "  " + fg(DIM) + sub_text
+                self.hits.append((HEADER_ROWS + len(lines) + 1, 1, self.cols,
+                                  lambda i=i, it=it: self.click_row(i, it)))
+                lines.append((1, pad_ + row + RESET))
+        lines += [(1, "")] * (h - 1 - len(lines))
+        lines = lines[:h - 1]
+        lines.append((1, pad_ + fg(DIM) + fit(self.hint(v), w) + RESET))
+        return lines
+
+    def panel_key(self, k):
+        v = self.view
+        items = v["items"]
+        if v["kind"] == "search" and self.typing:
+            if k == "\x1b":
+                self.back()
+            elif k in ENTER:
+                self.run_search()
+            elif k in BACKSPACE:
+                self.query = self.query[:-1]
+            elif k in DOWN and items:
+                self.typing = False
+            elif len(k) == 1 and k.isprintable():
+                self.query += k
+            return
+        sel = min(max(v["sel"], 0), len(items) - 1) if items else -1
+        item = items[sel] if sel >= 0 and items[sel]["kind"] != "header" else None
+        if k == "\x1b" or k in BACKSPACE:
+            self.back()
+        elif k in UP:
+            first = next((i for i, it in enumerate(items) if it["kind"] != "header"), 0)
+            if v["kind"] == "search" and sel <= first:
+                self.typing = True  # up from the first result goes back to the search box
+            else:
+                self.select(v, sel - 1, -1)
+        elif k in DOWN:
+            self.select(v, sel + 1, 1)
+        elif k == "/":
+            self.open_search()
+        elif k == "b":
+            self.open_library()
+        elif k == "c":
+            self.state.cancel()
+        elif not item:
+            return
+        elif k in ENTER:
+            self.activate(sel)
+        elif k == "n":
+            self.add_to_queue(item, "next")
+        elif k == "a":
+            self.add_to_queue(item, "end")
+        elif k == "r":
+            self.start_radio(item)
+        elif k in (DELETE, "x") and item["kind"] == "queued":
+            self.state.remove(item["index"], item["videoId"])
+
+    def click_row(self, i, item):
+        """First click selects a list row, clicking the selected row opens or plays it."""
+        v = self.view
+        if not v or i >= len(v["items"]) or v["items"][i] is not item:
+            return  # the list was reloaded since it was drawn
+        if i == v["sel"] and not self.typing:
+            self.activate(i)
+        else:
+            v["sel"], self.typing = i, False
+
+    # -- mouse -------------------------------------------------------------------
+
+    def mouse(self, seq):
+        """Handle an SGR mouse report like '\\x1b[<0;12;5M' (press/drag) or '...m' (release)."""
+        try:
+            b, x, y = (int(v) for v in seq[3:-1].split(";"))
+        except ValueError:
+            return
+        released = seq.endswith("m")
+        if b & 64:  # wheel: 64 up, 65 down
+            v = self.view
+            if v and v["items"]:
+                step = 1 if b & 1 else -1
+                self.select(v, v["sel"] + step, step)
+                self.typing = False
+            return
+        if self.drag_frac is not None:  # dragging the time bar
+            _, x0, width = self.track or (0, x, 1)
+            self.drag_frac = min(max((x - x0) / max(width - 1, 1), 0.0), 1.0)
+            if released:
+                if self.state.duration:
+                    self.state.seek(self.drag_frac * self.state.duration)
+                self.drag_frac = None
+            return
+        if released or b & 32 or (b & 3) != 0:  # only fresh left-button presses below
+            return
+        if self.track and y == self.track[0] and self.track[1] - 1 <= x <= self.track[1] + self.track[2]:
+            _, x0, width = self.track
+            self.drag_frac = min(max((x - x0) / max(width - 1, 1), 0.0), 1.0)
+            return
+        for row, x0, x1, callback in self.hits:
+            if y == row and x0 <= x <= x1:
+                callback()
+                return
+
+    # -- footer / draw -----------------------------------------------------------
+
+    def footer(self):
+        if self.state.source == "app":
+            keys = [("space", "play"), ("n/p", "next/prev"), ("l", "like"), ("s", "shuffle"),
+                    ("r", "repeat"), ("/", "search"), ("b", "library"), ("tab", "queue"),
+                    ("c", "cancel"), ("q", "quit")]
+        else:
+            keys = [("space", "play/pause"), ("n", "next"), ("p", "prev"), ("q", "quit")]
+        out, used = [], MARGIN
+        for k, d in keys:
+            piece_len = len(k) + len(d) + 3
+            if used + piece_len > self.cols:
+                break
+            out.append(fg(PINK, True) + k + RESET + fg(DIM) + " " + d)
+            used += piece_len
+        return [(1, ""), (1, " " * MARGIN + "  ".join(out) + RESET)]
+
+    def draw(self):
+        self.hits = []
+        st = self.state
+        if self.art_on:
+            self.art.want((st.video_id, st.image), st.image)
+        header = self.header()
+        body = self.panel_lines() if self.stack else self.bars()
+        lines = (header + body + self.footer())[:self.rows]
+        out = []
+        for i, line in enumerate(lines):
+            if self.drawn.get(i) == line:
+                continue
+            self.drawn[i] = line
+            col, text = line
+            # rows next to the album art are only cleared right of it, so the image survives
+            out.append(f"{ESC}{i + 1};{col}H" + (ESC + "K" if col > 1 else ESC + "2K") + text)
+        out.append(self.art.render(STATUS_ROW + 1, MARGIN + 1, self.art_on))
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        self.last_draw = time.time()
+
+    # -- input -------------------------------------------------------------------
+
+    def take_keys(self):
+        """Split buffered input into keys, keeping incomplete escape sequences for the next read."""
+        s, i, keys = self.inbuf, 0, []
+        while i < len(s):
+            if s[i] != "\x1b":
+                keys.append(s[i])
+                i += 1
+                continue
+            if i + 1 >= len(s):  # a lone Esc: wait briefly in case the rest of a sequence follows
+                if self.esc_since is None:
+                    self.esc_since = time.time()
+                if time.time() - self.esc_since < 0.05:
+                    break
+                keys.append("\x1b")
+                i += 1
+                continue
+            if s[i + 1] not in "[O":
+                keys.append("\x1b")
+                i += 1
+                continue
+            j = i + 2
+            while j < len(s) and not (s[j].isalpha() or s[j] == "~"):
+                j += 1
+            if j >= len(s):
+                break  # incomplete sequence (e.g. a mouse report split across reads)
+            keys.append(s[i:j + 1])
+            i = j + 1
+        self.inbuf = s[i:]
+        if not self.inbuf.startswith("\x1b") or len(self.inbuf) > 1:
+            self.esc_since = None
+        return keys
+
+    def key(self, k):
+        """Handle one key. Returns False to quit."""
+        if k == "\x03":
+            return False
+        if k.startswith("\x1b[<"):
+            self.mouse(k)
+            return True
+        if self.stack:
+            if self.view["kind"] == "search" and self.typing:
+                self.panel_key(k)
+                return True
+            if k == "\t":
+                self.open_queue()
+                return True
+            if k in ("q", "Q"):
+                return False
+            if k == " ":
+                self.press("toggle")
+                return True
+            self.panel_key(k)
+            return True
+        actions = {"l": "like", "d": "dislike", "s": "shuffle", "r": "repeat"}
+        if k in ("q", "Q"):
+            return False
+        if k == " ":
+            self.press("toggle")
+        elif k == "n":
+            self.press("next")
+        elif k == "p":
+            self.press("previous")
+        elif k == "/":
+            self.open_search()
+        elif k == "\t":
+            self.open_queue()
+        elif k == "b":
+            self.open_library()
+        elif k == "c":
+            self.state.cancel()
+        elif k in actions:
+            self.state.act(actions[k])
+        return True
+
+    def step(self, stdin):
+        """One pass of the main loop. Returns False to quit."""
+        now = time.time()
+        if self.resize_at and now - self.resize_at > 0.15:  # debounce window drags
+            self.layout()
+        fds = [stdin] + ([self.cava.fd] if self.cava else [])
+        timeout = 0.03 if self.inbuf else 0.1
+        ready, _, _ = select.select(fds, [], [], timeout)
+        redraw = False
+        if stdin in ready:
+            data = os.read(stdin, 4096)
+            if not data:
+                return False  # the terminal is gone
+            self.inbuf += self.decoder.decode(data)
+        for k in self.take_keys():
+            redraw = True
+            if not self.key(k):
+                return False
+        if self.cava and self.cava.fd in ready:
+            frame = self.cava.latest_frame()
+            if frame is not None:
+                self.levels = frame
+                redraw = redraw or not self.stack  # bars are hidden behind panels
+            elif self.cava.proc.poll() is not None:
+                self.cava = None
+                self.state.notify("The visualizer stopped (cava exited)")
+        if redraw or time.time() - self.last_draw > 0.1:  # 10 fps is plenty without bars
+            self.draw()
+        return True
+
+    def run(self):
+        stdin = sys.stdin.fileno()
+        old = termios.tcgetattr(stdin)
+        register_instance()
+
+        def leave(*_):
+            raise SystemExit(0)
+        signal.signal(signal.SIGHUP, leave)   # terminal window closed
+        signal.signal(signal.SIGTERM, leave)
+        sys.stdout.write(ESC + "?1049h" + ESC + "?25l" + MOUSE_ON)
+        try:
+            tty.setcbreak(stdin)
+            while True:
+                try:
+                    if not self.step(stdin):
+                        break
+                except (SystemExit, KeyboardInterrupt):
+                    raise
+                except OSError as e:
+                    if e.errno in (5, 9):  # EIO/EBADF: the terminal went away
+                        break
+                    log_error("main loop")
+                except Exception:  # keep the music and the screen alive; the details go to the log
+                    log_error("main loop")
+                    self.state.notify(f"Something went wrong, details in {ERROR_LOG}")
+                    time.sleep(0.05)
+        finally:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if self.cava:
+                self.cava.stop()
+            try:
+                termios.tcsetattr(stdin, termios.TCSADRAIN, old)
+                sys.stdout.write(self.art.clear() + MOUSE_OFF + RESET + ESC + "?25h" + ESC + "?1049l")
+                sys.stdout.flush()
+            except (OSError, termios.error):
+                pass  # the terminal is already gone; still stop the app below
+            if last_instance_closing():
+                stop_app()
+
+
+def image_capable_terminal():
+    term = os.environ.get("TERM", "") + " " + os.environ.get("TERM_PROGRAM", "")
+    return any(t in term for t in ("ghostty", "kitty", "WezTerm"))
+
+
+def open_in_ghostty():
+    """Started in a terminal that can't show album art: reopen in a Ghostty window instead."""
+    if image_capable_terminal() or os.environ.get("NOWPLAYING_GHOSTTY") or not shutil.which("ghostty"):
+        return False
+    env = dict(os.environ, NOWPLAYING_GHOSTTY="1")  # never relaunch twice, whatever TERM says
+    env.pop("NOWPLAYING_VENV", None)
+    subprocess.Popen(["ghostty", "--gtk-single-instance=false", "--class=local.nowplaying",
+                      "--title=Now Playing", "--window-width=120", "--window-height=40",
+                      "-e", os.path.abspath(sys.argv[0])],
+                     env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    print("Opened Now Playing in a Ghostty window.")
+    return True
+
+
+if __name__ == "__main__":
+    if open_in_ghostty():
+        sys.exit(0)
+    try:
+        Screen().run()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        log_error("fatal")
+    finally:
+        # Exit right away: run() has already restored the terminal and stopped the app, and a
+        # normal interpreter shutdown with the background threads still running can segfault.
+        try:
+            sys.stdout.flush()
+        except OSError:
+            pass
+        os._exit(0)

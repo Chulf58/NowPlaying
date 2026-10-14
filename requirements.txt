@@ -1,0 +1,4 @@
+ytmusicapi
+pillow
+secretstorage
+cryptography

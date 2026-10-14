@@ -1,0 +1,10 @@
+# Never commit logins, tokens or caches
+token
+*auth*.json
+Cookies
+*.bak*
+library.json
+error.log
+__pycache__/
+venv/
+.venv/

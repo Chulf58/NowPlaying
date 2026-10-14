@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Now Playing
+Comment=Synthwave now-playing screen with visualizer and media controls
+Exec=ghostty --gtk-single-instance=false --class=local.nowplaying --title="Now Playing" --window-width=120 --window-height=40 -e @BIN@
+Icon=multimedia-audio-player
+Terminal=false
+StartupWMClass=local.nowplaying
+Categories=AudioVideo;Audio;Player;
