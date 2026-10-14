@@ -12,34 +12,85 @@ A synthwave terminal "now playing" screen and controller for the
 
 ## Requirements
 
-- Linux with GNOME (the login is read from the GNOME keyring)
-- Python 3.10+ with `venv`
-- [YouTube Music desktop app](https://github.com/pear-devs/pear-desktop/releases) (`youtube-music` command)
-- `cava` and `playerctl`: `sudo apt install cava playerctl`
-- A terminal with the kitty graphics protocol for album art. The launcher uses
-  [Ghostty](https://ghostty.org); kitty and WezTerm also work if you run `nowplaying` directly.
+- Linux with GNOME, e.g. Ubuntu (the login is read from the GNOME keyring)
+- Python 3.10 or newer (Ubuntu has it already)
+- The YouTube Music desktop app
+- `cava`, `playerctl` and `git`
+- The Ghostty terminal, for the launcher and album art. kitty and WezTerm also
+  work if you run `nowplaying` from them yourself.
 
-## Setup
+## Setup (step by step)
 
-1. **Configure the YouTube Music app** (in the app's menu → Plugins):
-   - Enable **API Server** (host `127.0.0.1`, port `26538`, authorization "at first").
-   - Enable **Shortcuts (& MPRIS)**.
-   - Sign in to your YouTube / Google account in the app.
-2. **Install:**
+### 1. Install the programs it needs
+
+Open a terminal and run:
+
+```bash
+sudo apt install git python3-venv cava playerctl
+sudo snap install ghostty --classic
+```
+
+### 2. Install the YouTube Music app
+
+1. Go to <https://github.com/pear-devs/pear-desktop/releases/latest>.
+2. Under **Assets**, download `youtube-music_<version>_amd64.deb`.
+3. Install it (in the folder you downloaded it to):
    ```bash
-   git clone https://github.com/Chulf58/NowPlaying.git
-   cd NowPlaying
-   ./install.sh
+   sudo apt install ./youtube-music_*_amd64.deb
    ```
-   This copies the script to `~/.local/bin/nowplaying`, creates a Python venv in
-   `~/.local/share/nowplaying/venv` and adds a "Now Playing" launcher to the app menu.
-3. **First start:** open Now Playing. The YouTube Music app shows an
-   Allow/Deny dialog. Click **Allow**.
 
-Now Playing starts the YouTube Music app for you and quits it when you close the
-last Now Playing window. To keep the app window hidden, close the app and set
-`"appVisible": false` and `"tray": false` under `options` in
-`~/.config/YouTube Music/config.json`.
+### 3. Set up the YouTube Music app
+
+1. Open **YouTube Music** from the app menu.
+2. Sign in to your Google / YouTube account in the app.
+3. In the menu bar at the top of the window (press `Alt` if you can't see it),
+   open **Plugins** and turn on:
+   - **API Server**. Keep the defaults: host `127.0.0.1`, port `26538`,
+     authorization "at first".
+   - **Shortcuts (& MPRIS)**
+4. Close the app.
+
+### 4. Install Now Playing
+
+```bash
+git clone https://github.com/Chulf58/NowPlaying.git
+cd NowPlaying
+./install.sh
+```
+
+This copies the script to `~/.local/bin/nowplaying`, creates a Python venv in
+`~/.local/share/nowplaying/venv` and adds **Now Playing** to the app menu.
+
+### 5. First start
+
+1. Open **Now Playing** from the app menu. It starts YouTube Music for you.
+2. YouTube Music asks whether to allow "nowplaying". Click **Allow**.
+3. If your computer asks to unlock the keyring, enter your login password. This
+   lets Now Playing read the app's login for your library and playlists.
+
+Now Playing quits YouTube Music when you close the last Now Playing window.
+
+**Optional: keep the YouTube Music window hidden.** Close the app, open
+`~/.config/YouTube Music/config.json` and set `"appVisible": false` and
+`"tray": false` under `options`. To sign in again later, use
+**Library › Sign in** in Now Playing, which shows the app window.
+
+## Updating
+
+```bash
+cd NowPlaying
+git pull
+./install.sh
+```
+
+## Troubleshooting
+
+- **The library says you're not signed in:** sign in in the YouTube Music app
+  (Library › Sign in in Now Playing opens it).
+- **You clicked Deny, or it keeps asking for permission:** close Now Playing,
+  run `rm ~/.config/nowplaying/token`, and start it again.
+- **No visualizer:** check that `cava` is installed.
+- **Something else went wrong:** look in `~/.cache/nowplaying/error.log`.
 
 ## Keys
 
