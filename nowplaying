@@ -900,25 +900,36 @@ class State:
                 self.notify("Nothing to play")
                 return
             self.job["total"] = len(ids)
+            # Queue the second song first, so it follows the first one right away: when nothing
+            # follows the playing song, the app fills the queue with its own autoplay songs.
+            if len(ids) > 1:
+                self._add_and_wait(ids[1], "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check, fast=True)
             if not self._start(ids[0], check):
                 return
-            self.job["done"] = 1
-            # drop the old queue around the song that's now playing (from the end, so indexes stay valid)
-            snapshot = self.api.queue()
-            keep = next((q["index"] for q in snapshot if q["current"] and q["videoId"] == ids[0]), None)
-            if keep is not None:
-                for q in reversed(snapshot):
-                    check()
-                    if q["index"] != keep:
-                        self.api.request("DELETE", f"/api/v1/queue/{q['index']}")
+            self.job["done"] = min(len(ids), 2)
+            self._refresh_extras()  # show "up next" as soon as there is one
+            if any(q["current"] and q["videoId"] == ids[0] for q in self.api.queue()):
+                self._remove_others(ids[:2], check)
             before = self.api.queue()
-            for vid in ids[1:]:
+            for vid in ids[2:]:
                 check()
                 _, before = self._add_and_wait(vid, "INSERT_AT_END", before, check, timeout=6)
                 self.job["done"] += 1
-                if self.job["done"] == 2:
-                    self._refresh_extras()  # show "up next" as soon as there is one
+            self._remove_others(ids, check)  # autoplay songs the app added while we were busy
         self.submit(job, replace=True)
+
+    def _remove_others(self, ids, check):
+        """Delete queue items that aren't in `ids` (keeping the current song and the newest copies)."""
+        want = collections.Counter(ids)
+        drop = []
+        for q in reversed(self.api.queue()):
+            if q["current"] or want[q["videoId"]] > 0:
+                want[q["videoId"]] -= 1
+            else:
+                drop.append(q["index"])
+        for index in drop:  # from the end, so indexes stay valid
+            check()
+            self.api.request("DELETE", f"/api/v1/queue/{index}")
 
     def add(self, label, fetch, where="INSERT_AT_END"):
         """Add songs to the queue in order (after the current song for 'next')."""
