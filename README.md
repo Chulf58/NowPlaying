@@ -77,6 +77,14 @@ Now Playing quits YouTube Music when you close the last Now Playing window.
 
 ## Updating
 
+Now Playing checks GitHub for a new version when it starts (and every 6 hours
+while it runs). When there is one, it asks **"A new update is available. Do you
+want to download it?"**. Click **Yes, download** (or press `y`) and it downloads
+and installs the new version, then offers to restart. Click **No** (or press
+`n`) and it asks again the next time you start it.
+
+If you installed a version without the update check, update by hand once:
+
 ```bash
 cd NowPlaying
 git pull
@@ -90,6 +98,8 @@ git pull
 - **You clicked Deny, or it keeps asking for permission:** close Now Playing,
   run `rm ~/.config/nowplaying/token`, and start it again.
 - **No visualizer:** check that `cava` is installed.
+- **An update failed:** look in `~/.cache/nowplaying/update.log`, or update by hand
+  (see Updating).
 - **Something else went wrong:** look in `~/.cache/nowplaying/error.log`.
 
 ## Keys

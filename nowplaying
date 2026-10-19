@@ -35,6 +35,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import termios
 import threading
 import time
@@ -43,6 +44,10 @@ import tty
 import unicodedata
 import urllib.error
 import urllib.request
+
+# Bump on every release: running copies offer to update when GitHub has a higher number
+VERSION = "1.1"
+REPO = "Chulf58/NowPlaying"
 
 # Bottom -> top gradient for the bars (same palette as ~/.config/cava/config)
 STOPS = ("#00e5ff", "#3d5afe", "#7b2ff7", "#c724f2", "#ff2bd6", "#ff4f7b", "#ff8c42", "#ffd319")
@@ -76,6 +81,11 @@ CACHE = os.path.expanduser("~/.cache/nowplaying")
 CAVA_CONF = os.path.join(CACHE, "cava-raw.conf")
 INSTANCES = os.path.join(CACHE, "instances")
 ERROR_LOG = os.path.join(CACHE, "error.log")
+UPDATE_LOG = os.path.join(CACHE, "update.log")
+UPDATE_DIR = os.path.join(CACHE, "update")
+LATEST_SCRIPT_URL = f"https://raw.githubusercontent.com/{REPO}/main/nowplaying"
+LATEST_TARBALL_URL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main"
+UPDATE_CHECK_EVERY = 6 * 3600
 
 # ytmusicapi (library, playlists, home, radio) and Pillow (album art) live in a
 # private venv; re-run under it if needed
@@ -509,8 +519,8 @@ class State:
 
     def elapsed(self):
         with self.lock:
-            if self.playing:
-                return self.position + (time.time() - self.position_at)
+            if self.playing:  # the app reports the time about every second; never run on far past that
+                return self.position + min(time.time() - self.position_at, 2.0)
             return self.position
 
     def _set_position(self, pos):
@@ -666,9 +676,31 @@ class State:
         self.submit(job)
 
     def _ticker(self):
+        n = 0
         while True:
-            time.sleep(15)
-            self._refresh_extras()
+            time.sleep(3)
+            n += 1
+            self._sync_playback()
+            if n % 5 == 0:
+                self._refresh_extras()
+
+    def _sync_playback(self):
+        """The app skips play/pause events near 0:00 and before a song's info has loaded: re-check."""
+        if self.source != "app":
+            return
+        try:
+            song = self.api.request("GET", "/api/v1/song") or {}
+        except AuthError:
+            self.invalidate_token()
+            return
+        except (OSError, ValueError):
+            return
+        with self.lock:
+            if self.source != "app" or song.get("videoId") != self.video_id or "isPaused" not in song:
+                return
+            self.playing = not song["isPaused"]
+            if not self.playing or abs(self.elapsed() - (song.get("elapsedSeconds") or 0)) > 2:
+                self._set_position(song.get("elapsedSeconds"))
 
     # -- playerctl fallback --------------------------------------------------
 
@@ -705,12 +737,13 @@ class State:
 
     def act(self, name):
         """Run a player action in the background, via the app if connected."""
+        known = self.like is not None
         if name in ("like", "dislike") and self.source == "app":  # instant feedback, confirmed by the refresh
             state = name.upper()
             self.like = None if self.like == state else state
-        threading.Thread(target=self._act, args=(name,), daemon=True).start()
+        threading.Thread(target=self._act, args=(name, known), daemon=True).start()
 
-    def _act(self, name):
+    def _act(self, name, known=True):
         if self.source != "app":
             mpris = {"toggle": ("play-pause",), "next": ("next",), "previous": ("previous",)}
             if name in mpris:
@@ -729,6 +762,12 @@ class State:
         skip = name == "dislike" and self.like == "DISLIKE"  # just disliked (not undone): move on, like YouTube Music
         song = self.video_id
         try:
+            if name in ("like", "dislike") and not known:
+                # the app's like/dislike toggles: on a song already liked, "like" would remove the like
+                state = (self.api.request("GET", "/api/v1/like-state") or {}).get("state")
+                if state == name.upper():
+                    self.like = state
+                    return
             self.api.request(*calls[name])
             if skip:
                 time.sleep(0.6)
@@ -1436,6 +1475,86 @@ def stop_app():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ---------------------------------------------------------------------- updates
+
+def version_key(version):
+    return tuple(int(n) for n in version.split("."))
+
+
+class Updater:
+    """Checks GitHub for a newer Now Playing and, once the user says yes, installs it.
+
+    The screen asks the questions: `offer` is a newer version waiting for a yes/no,
+    `ready` a version that was just installed and needs a restart.
+    """
+
+    def __init__(self, state):
+        self.state = state
+        self.offer = self.ready = None
+        self.busy = False
+        self.declined = set()  # asked again the next time Now Playing starts
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        time.sleep(5)  # let the app connect first
+        while True:
+            try:
+                latest = self.latest_version()
+                if (latest and version_key(latest) > version_key(VERSION) and latest not in self.declined
+                        and not self.busy and not self.ready):
+                    self.offer = latest
+            except Exception:  # offline or GitHub unreachable: try again later
+                pass
+            time.sleep(UPDATE_CHECK_EVERY)
+
+    @staticmethod
+    def latest_version():
+        with urllib.request.urlopen(LATEST_SCRIPT_URL, timeout=10) as resp:
+            head = resp.read(16384)
+        m = re.search(rb'^VERSION = "([0-9.]+)"', head, re.M)
+        return m.group(1).decode() if m else None
+
+    def answer(self, yes):
+        version, self.offer = self.offer, None
+        if not version:
+            return
+        if not yes:
+            self.declined.add(version)
+            return
+        self.busy = True
+        threading.Thread(target=self._install, args=(version,), daemon=True).start()
+
+    def _install(self, version):
+        """Download the repo from GitHub and run its install.sh, as a manual update would."""
+        notice = f"Downloading Now Playing {version}…"
+        self.state.notify(notice, 600)
+        try:
+            shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+            os.makedirs(UPDATE_DIR)
+            with urllib.request.urlopen(LATEST_TARBALL_URL, timeout=60) as resp:
+                data = resp.read()
+            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(UPDATE_DIR, filter="data")
+                else:  # Python without tar filters: refuse paths that leave the folder
+                    for m in tar.getmembers():
+                        if m.name.startswith("/") or ".." in m.name.split("/") or m.issym() or m.islnk():
+                            raise ValueError(f"unexpected path in the download: {m.name}")
+                    tar.extractall(UPDATE_DIR)
+            src = next(e.path for e in os.scandir(UPDATE_DIR) if e.is_dir())
+            with open(UPDATE_LOG, "w") as log:
+                subprocess.run(["bash", "install.sh"], cwd=src, stdin=subprocess.DEVNULL,
+                               stdout=log, stderr=subprocess.STDOUT, timeout=900, check=True)
+            self.state.clear_notice(notice)
+            self.ready = version
+        except Exception:
+            log_error("update")
+            self.state.notify(f"The update failed, details in {UPDATE_LOG} and {ERROR_LOG}", 10)
+        finally:
+            shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+            self.busy = False
+
+
 # ----------------------------------------------------------------------- screen
 
 UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
@@ -1451,6 +1570,8 @@ class Screen:
         if self.lib.available:
             self.state.autoplay = lambda vid: self.lib.radio_ids(vid)[1:]
         self.art = AlbumArt()
+        self.updater = Updater(self.state)
+        self.restart = False        # quit and start the freshly installed version
         self.cava, self.cava_dims, self.levels = None, None, []
         self.cols, self.rows = 0, 0
         self.resize_at = time.time() - 1  # lay out on the first loop (past the resize debounce)
@@ -1756,8 +1877,8 @@ class Screen:
                 items = loader()
             except Exception as e:  # ytmusicapi raises many kinds of errors; show them, don't crash
                 if gen == v["gen"]:
-                    if cached:
-                        self.state.notify(friendly_error(e))  # keep showing the remembered list
+                    if cached:  # keep showing the remembered list, but say it may be out of date
+                        self.state.notify("Showing a saved copy (may be out of date): " + friendly_error(e), 10)
                     else:
                         v["msg"] = friendly_error(e)
                 return
@@ -2097,6 +2218,56 @@ class Screen:
         else:
             v["sel"], self.typing = i, False
 
+    # -- update prompt -----------------------------------------------------------
+
+    def prompt(self):
+        """The update question to show as (lines, yes label, no label, answer), or None."""
+        up = self.updater
+        if up.ready:
+            return ([f"Now Playing {up.ready} is installed.", "Restart now to start using it?"],
+                    "RESTART NOW", "LATER", self.answer_restart)
+        if up.offer:
+            return ([f"A new update is available: Now Playing {up.offer}",
+                     f"(you have {VERSION}). Do you want to download it?"],
+                    "YES, DOWNLOAD", "NO", up.answer)
+        return None
+
+    def answer_restart(self, yes):
+        self.updater.ready = None
+        self.restart = yes
+
+    def prompt_lines(self, prompt):
+        """A centered box with the question and clickable yes/no buttons, filling the body area."""
+        text, yes, no, answer = prompt
+        buttons = [(f"  {yes}  ", bg(BUTTON_BG) + fg(CYAN, True), lambda: answer(True)),
+                   (f"  {no}  ", bg(BUTTON_BG) + fg(PINK, True), lambda: answer(False))]
+        hint = "y yes · n no"
+        buttons_w = sum(cells(t) for t, _, _ in buttons) + 3
+        inner = min(max(max(cells(t) for t in text), buttons_w) + 6, self.cols - 2)
+        x0 = max((self.cols - inner - 2) // 2, 0) + 1  # 1-based column of the left border
+        top = HEADER_ROWS + max((self.area - 8 - len(text)) // 2, 0) + 1
+
+        def row(content, width, style=""):
+            left = max((inner - width) // 2, 0)
+            return (1, " " * (x0 - 1) + fg(PURPLE) + "│" + RESET + " " * left + style + content + RESET
+                    + " " * max(inner - left - width, 0) + fg(PURPLE) + "│" + RESET)
+
+        lines = [(1, "")] * (top - HEADER_ROWS - 1)
+        lines.append((1, " " * (x0 - 1) + fg(PURPLE) + "╭" + "─" * inner + "╮" + RESET))
+        lines.append(row("", 0))
+        for t in text:
+            t = fit(t, inner - 2)
+            lines.append(row(t, cells(t), fg(TEXT, True)))
+        lines.append(row("", 0))
+        button_row = HEADER_ROWS + len(lines) + 1
+        btn_text, _ = self.segments(button_row, x0 + 1 + max((inner - buttons_w) // 2, 0), buttons, gap=3)
+        lines.append(row(btn_text, buttons_w))
+        lines.append(row("", 0))
+        lines.append(row(fit(hint, inner - 2), cells(fit(hint, inner - 2)), fg(DIM)))
+        lines.append((1, " " * (x0 - 1) + fg(PURPLE) + "╰" + "─" * inner + "╯" + RESET))
+        lines += [(1, "")] * (self.area - len(lines))
+        return lines[:self.area]
+
     # -- mouse -------------------------------------------------------------------
 
     def mouse(self, seq):
@@ -2156,7 +2327,8 @@ class Screen:
         if self.art_on:
             self.art.want((st.video_id, st.image), st.image)
         header = self.header()
-        body = self.panel_lines() if self.stack else self.bars()
+        prompt = self.prompt()
+        body = self.prompt_lines(prompt) if prompt else self.panel_lines() if self.stack else self.bars()
         lines = (header + body + self.footer())[:self.rows]
         out = []
         for i, line in enumerate(lines):
@@ -2212,6 +2384,10 @@ class Screen:
         if k.startswith("\x1b[<"):
             self.mouse(k)
             return True
+        prompt = self.prompt()
+        if prompt and (k in ("y", "Y", "n", "N", "\x1b") or k in ENTER):
+            prompt[3](k in ("y", "Y") or k in ENTER)
+            return True
         if self.stack:
             if self.view["kind"] == "search" and self.typing:
                 self.panel_key(k)
@@ -2265,6 +2441,8 @@ class Screen:
             redraw = True
             if not self.key(k):
                 return False
+        if self.restart:
+            return False
         if self.cava and self.cava.fd in ready:
             frame = self.cava.latest_frame()
             if frame is not None:
@@ -2314,8 +2492,8 @@ class Screen:
                 sys.stdout.flush()
             except (OSError, termios.error):
                 pass  # the terminal is already gone; still stop the app below
-            if last_instance_closing():
-                stop_app()
+            if not self.restart and last_instance_closing():
+                stop_app()  # restarting keeps the app (and this window's registration) running
 
 
 def image_capable_terminal():
@@ -2341,8 +2519,10 @@ def open_in_ghostty():
 if __name__ == "__main__":
     if open_in_ghostty():
         sys.exit(0)
+    screen = None
     try:
-        Screen().run()
+        screen = Screen()
+        screen.run()
     except KeyboardInterrupt:
         pass
     except Exception:
@@ -2354,4 +2534,9 @@ if __name__ == "__main__":
             sys.stdout.flush()
         except OSError:
             pass
+        if screen and screen.restart:  # an update was installed over this script: run the new one
+            try:
+                os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
+            except OSError:
+                log_error("restart")
         os._exit(0)
