@@ -46,7 +46,7 @@ import urllib.error
 import urllib.request
 
 # Bump on every release: running copies offer to update when GitHub has a higher number
-VERSION = "1.1"
+VERSION = "1.2"
 REPO = "Chulf58/NowPlaying"
 
 # Bottom -> top gradient for the bars (same palette as ~/.config/cava/config)
@@ -283,6 +283,13 @@ def log_error(context=""):
 
 # --------------------------------------------------------------------------- API
 
+def friendly_app_error(e):
+    """What to tell the user when a request to the YouTube Music app failed."""
+    if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+        return "YouTube Music is busy and didn't answer in time, try again in a moment"
+    return "YouTube Music didn't respond, try again in a moment"
+
+
 class AuthError(Exception):
     pass
 
@@ -304,7 +311,18 @@ class Api:
         except OSError:
             pass
 
-    def request(self, method, path, body=None, timeout=4, auth=True):
+    def request(self, method, path, body=None, timeout=15, auth=True):
+        """One API call. The app can stall for seconds (just after it starts, or while it's busy
+        loading songs), so the timeout is generous and a timed-out read is retried once."""
+        for attempt in range(2):
+            try:
+                return self._request(method, path, body, timeout, auth)
+            except (TimeoutError, urllib.error.URLError) as e:
+                timed_out = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+                if not timed_out or method != "GET" or attempt:
+                    raise
+
+    def _request(self, method, path, body, timeout, auth):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(f"http://{API_HOST}:{API_PORT}{path}", data=data, method=method)
         if data is not None:
@@ -778,8 +796,8 @@ class State:
                 self._refresh_extras()
         except AuthError:
             self.invalidate_token()
-        except (OSError, ValueError):
-            self.notify("YouTube Music didn't respond")
+        except (OSError, ValueError) as e:
+            self.notify(friendly_app_error(e))
 
     def seek(self, seconds):
         """Jump to an absolute position in the current song."""
@@ -833,7 +851,7 @@ class State:
                 self.invalidate_token()
                 self.notify("Reconnecting to YouTube Music…")
             except (OSError, ValueError) as e:
-                self.notify(f"YouTube Music didn't respond ({e})")
+                self.notify(friendly_app_error(e))
             except Exception:  # never let one bad job stop the worker
                 log_error("queue job")
                 self.notify(f"Something went wrong, details in {ERROR_LOG}")
