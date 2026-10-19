@@ -17,15 +17,26 @@ Mouse: everything in the header is clickable (status, like/shuffle/repeat,
 search/library/queue, artist, up next, prev/play/next), drag the time bar to
 seek, click a row to select it and again to play it, wheel scrolls lists.
 """
+import os
+import sys
+from importlib.util import find_spec
+
+# ytmusicapi (library, playlists, home, radio) and Pillow (album art) live in a
+# private venv; re-run under it if needed, before loading anything else
+VENV_PY = os.path.expanduser("~/.local/share/nowplaying/venv/bin/python")
+if find_spec("ytmusicapi") is None and os.path.exists(VENV_PY) and not os.environ.get("NOWPLAYING_VENV"):
+    os.environ["NOWPLAYING_VENV"] = "1"
+    os.execv(VENV_PY, [VENV_PY] + sys.argv)
+
 import base64
 import codecs
 import collections
+import ctypes
 import fcntl
 import functools
 import hashlib
 import io
 import json
-import os
 import queue
 import re
 import select
@@ -34,7 +45,6 @@ import sqlite3
 import signal
 import socket
 import subprocess
-import sys
 import tarfile
 import termios
 import threading
@@ -46,7 +56,7 @@ import urllib.error
 import urllib.request
 
 # Bump on every release: running copies offer to update when GitHub has a higher number
-VERSION = "1.2"
+VERSION = "1.3"
 REPO = "Chulf58/NowPlaying"
 
 # Bottom -> top gradient for the bars (same palette as ~/.config/cava/config)
@@ -87,27 +97,19 @@ LATEST_SCRIPT_URL = f"https://raw.githubusercontent.com/{REPO}/main/nowplaying"
 LATEST_TARBALL_URL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main"
 UPDATE_CHECK_EVERY = 6 * 3600
 
-# ytmusicapi (library, playlists, home, radio) and Pillow (album art) live in a
-# private venv; re-run under it if needed
-VENV_PY = os.path.expanduser("~/.local/share/nowplaying/venv/bin/python")
+# Imported where first used, in background threads, as they take most of the start-up time:
+# ytmusicapi in Library.yt, Pillow in AlbumArt._fetch, secretstorage and cryptography for
+# reading the app's login (its cookies are encrypted like Chromium's)
+HAVE_YTMUSIC = find_spec("ytmusicapi") is not None
+HAVE_PIL = find_spec("PIL") is not None
+HAVE_CRYPTO = find_spec("secretstorage") is not None and find_spec("cryptography") is not None
+
+# At most 2 malloc arenas (glibc gives every thread its own, and the large responses parsed in the
+# background threads leave each one holding freed memory: ~20% less resident memory)
 try:
-    from ytmusicapi import YTMusic
-except ImportError:
-    if os.path.exists(VENV_PY) and not os.environ.get("NOWPLAYING_VENV"):
-        os.environ["NOWPLAYING_VENV"] = "1"
-        os.execv(VENV_PY, [VENV_PY] + sys.argv)
-    YTMusic = None
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-try:  # reading the app's login (its cookies are encrypted like Chromium's)
-    import secretstorage
-    from cryptography.hazmat.primitives import hashes, padding
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-except ImportError:
-    secretstorage = None
+    ctypes.CDLL(None).mallopt(-8, 2)  # M_ARENA_MAX
+except (OSError, AttributeError):
+    pass
 
 ESC = "\x1b["
 RESET = ESC + "0m"
@@ -874,24 +876,47 @@ class State:
             return after[pos]["index"]
         return hits[-1] if where == "INSERT_AT_END" else hits[0]
 
+    @staticmethod
+    def _with_inserted(snapshot, index, video_id):
+        """`snapshot` with `video_id` inserted at API index `index` (what the app just did)."""
+        out = [dict(q, index=q["index"] + 1) if q["index"] >= index else q for q in snapshot]
+        pos = next((i for i, q in enumerate(snapshot) if q["index"] >= index), len(snapshot))
+        out.insert(pos, {"index": index, "title": "", "artist": "", "length": "", "videoId": video_id,
+                         "current": False})
+        return out
+
     def _add_and_wait(self, video_id, where, before, check, timeout=8.0, fast=False):
         """Add a song; return (its API index or None, latest queue snapshot)."""
+        # Right after the current song, watching /queue/next is enough: the whole queue is ~17 KB of
+        # JSON per song (0.1 s to parse with 100 songs, holding up the UI). The full check takes over
+        # if the song changes meanwhile or ours doesn't turn up there.
+        cur = next((q for q in before if q["current"]), None)
+        following = next((q for q in before if cur and q["index"] > cur["index"]), None)
+        quick = (where == "INSERT_AFTER_CURRENT_VIDEO" and cur is not None and self.source == "app"
+                 and cur["videoId"] == self.video_id and (following or {}).get("videoId") != video_id)
         self.api.request("POST", "/api/v1/queue", {"videoId": video_id, "insertPosition": where})
         # first look when the previous add showed up (the app's delay is fairly steady), then poll faster
         start = time.time()
         after, delay = before, min(max(getattr(self, "add_delay", 0.15) * 0.9, 0.15), 1.0)
         if fast:
             delay = 0.05
-        deadline = start + timeout
+        deadline, quick_until = start + timeout, start + max(getattr(self, "add_delay", 0) * 2, 2.0)
         while time.time() < deadline:
             time.sleep(delay)
             check()
+            delay = 0.05 if fast else 0.15 if delay > 0.15 else min(delay * 1.5, 0.6)
+            if quick and (self.video_id != cur["videoId"] or time.time() > quick_until):
+                quick = False
+            if quick:
+                if (self.api.request("GET", "/api/v1/queue/next") or {}).get("videoId") == video_id:
+                    self.add_delay = time.time() - start
+                    return cur["index"] + 1, self._with_inserted(before, cur["index"] + 1, video_id)
+                continue
             after = self.api.queue()
             index = self._new_index(before, after, video_id, where)
             if index is not None:
                 self.add_delay = time.time() - start
                 return index, after
-            delay = 0.05 if fast else 0.15 if delay > 0.15 else min(delay * 1.5, 0.6)
         return None, after
 
     def _jump_and_verify(self, index, video_id, check):
@@ -911,10 +936,10 @@ class State:
             index = found[0]  # the queue shifted; retry at the song's new position
         return False
 
-    def _start(self, video_id, check):
+    def _start(self, video_id, check, before=None):
         """Insert a song after the current one and play it (polling fast: the user is waiting)."""
-        index, _ = self._add_and_wait(video_id, "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check,
-                                      fast=True)
+        before = self.api.queue() if before is None else before
+        index, _ = self._add_and_wait(video_id, "INSERT_AFTER_CURRENT_VIDEO", before, check, fast=True)
         if index is None:
             self.pending = None
             self.notify("YouTube Music didn't add the song, try again")
@@ -959,15 +984,18 @@ class State:
             self.job["total"] = len(ids)
             # Queue the second song first, so it follows the first one right away: when nothing
             # follows the playing song, the app fills the queue with its own autoplay songs.
+            before = None
             if len(ids) > 1:
-                self._add_and_wait(ids[1], "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check, fast=True)
-            if not self._start(ids[0], check):
+                index, before = self._add_and_wait(ids[1], "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check,
+                                                   fast=True)
+                before = before if index is not None else None
+            if not self._start(ids[0], check, before):
                 return
             self.job["done"] = min(len(ids), 2)
             self._refresh_extras()  # show "up next" as soon as there is one
-            if any(q["current"] and q["videoId"] == ids[0] for q in self.api.queue()):
-                self._remove_others(ids[:2], check)
             before = self.api.queue()
+            if any(q["current"] and q["videoId"] == ids[0] for q in before):
+                before = self._remove_others(ids[:2], check, before)
             for vid in ids[2:]:
                 check()
                 _, before = self._add_and_wait(vid, "INSERT_AT_END", before, check, timeout=6)
@@ -975,11 +1003,13 @@ class State:
             self._remove_others(ids, check)  # autoplay songs the app added while we were busy
         self.submit(job, replace=True)
 
-    def _remove_others(self, ids, check):
-        """Delete queue items that aren't in `ids` (keeping the current song and the newest copies)."""
+    def _remove_others(self, ids, check, snapshot=None):
+        """Delete queue items that aren't in `ids` (keeping the current song and the newest copies).
+        Returns the queue as it is now, without asking the app again."""
+        snapshot = self.api.queue() if snapshot is None else snapshot
         want = collections.Counter(ids)
         drop = []
-        for q in reversed(self.api.queue()):
+        for q in reversed(snapshot):
             if q["current"] or want[q["videoId"]] > 0:
                 want[q["videoId"]] -= 1
             else:
@@ -987,6 +1017,9 @@ class State:
         for index in drop:  # from the end, so indexes stay valid
             check()
             self.api.request("DELETE", f"/api/v1/queue/{index}")
+        gone = set(drop)
+        return [dict(q, index=q["index"] - sum(d < q["index"] for d in drop))
+                for q in snapshot if q["index"] not in gone]
 
     def add(self, label, fetch, where="INSERT_AT_END"):
         """Add songs to the queue in order (after the current song for 'next')."""
@@ -1086,6 +1119,8 @@ LIBRARY_CACHE = os.path.join(CACHE, "library.json")
 # kept in the GNOME keyring, "v10" with Chromium's fixed fallback password.
 
 def _cookie_key(password):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     kdf = PBKDF2HMAC(algorithm=hashes.SHA1(), length=16, salt=b"saltysalt", iterations=1)
     return kdf.derive(password)
 
@@ -1094,6 +1129,7 @@ def _keyring_passwords():
     """Chromium "Safe Storage" passwords from the keyring, the app's own first."""
     found = []
     try:
+        import secretstorage
         conn = secretstorage.dbus_init()
         for schema in ("chrome_libsecret_os_crypt_password_v2", "chrome_libsecret_os_crypt_password_v1"):
             for item in secretstorage.search_items(conn, {"xdg:schema": schema}):
@@ -1107,6 +1143,8 @@ def _keyring_passwords():
 
 
 def _decrypt(blob, keys, host, strip_hash):
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     for key in keys:
         dec = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
         unpad = padding.PKCS7(128).unpadder()
@@ -1127,7 +1165,7 @@ def _decrypt(blob, keys, host, strip_hash):
 
 def app_login_headers():
     """Request headers carrying the YouTube Music app's login, or None if it isn't signed in."""
-    if secretstorage is None or not os.path.exists(APP_COOKIES):
+    if not HAVE_CRYPTO or not os.path.exists(APP_COOKIES):
         return None
     with open(APP_COOKIES, "rb") as f:  # read a snapshot: the app keeps the file open
         data = f.read()
@@ -1185,13 +1223,11 @@ class Library:
 
     def __init__(self):
         self._yt, self._yt_at = None, 0.0
+        self.visitor = None         # ytmusicapi's visitor id, kept when the login is re-read
         self.yt_lock = threading.Lock()
-        self.logged_in = False
-        if self.available:
-            try:
-                self.logged_in = app_login_headers() is not None
-            except Exception:
-                log_error("app login")
+        self.logged_in = False      # set by the first yt(), which the warm-up thread does right away
+        if self.available:  # the keyring can be slow (or even ask for its password): not before the first frame
+            threading.Thread(target=self.warm_up, daemon=True).start()
         self.cache_lock = threading.Lock()
         try:
             with open(LIBRARY_CACHE) as f:
@@ -1219,9 +1255,16 @@ class Library:
 
     @property
     def available(self):
-        return YTMusic is not None
+        return HAVE_YTMUSIC
+
+    def warm_up(self):
+        try:
+            self.yt()
+        except Exception:  # offline: the first library call tries again and shows why
+            pass
 
     def yt(self):
+        from ytmusicapi import YTMusic
         with self.yt_lock:
             stale = time.time() - self._yt_at > self.LOGIN_TTL
             if self._yt is None or stale or not self.logged_in:
@@ -1230,9 +1273,14 @@ class Library:
                 except Exception:
                     log_error("app login")
                     headers = None
-                if self._yt is None or headers or self.logged_in:
+                was_logged_in, self.logged_in = self.logged_in, headers is not None
+                if self._yt is None or headers or was_logged_in:
+                    if headers and self.visitor:  # a new one costs loading the whole music.youtube.com page
+                        headers["X-Goog-Visitor-Id"] = self.visitor
                     self._yt = YTMusic(headers) if headers else YTMusic()
-                self.logged_in, self._yt_at = headers is not None, time.time()
+                    if headers:  # signed in, ytmusicapi has set up its headers already
+                        self.visitor = self._yt.base_headers.get("X-Goog-Visitor-Id")
+                self._yt_at = time.time()
             return self._yt
 
     def search(self, query):
@@ -1335,12 +1383,13 @@ class AlbumArt:
 
     def __init__(self):
         term = os.environ.get("TERM", "") + " " + os.environ.get("TERM_PROGRAM", "")
-        self.enabled = Image is not None and any(t in term for t in ("ghostty", "kitty", "WezTerm"))
+        self.enabled = HAVE_PIL and any(t in term for t in ("ghostty", "kitty", "WezTerm"))
         self.key = None           # (video id, url) of the art we have / are fetching
         self.pending = None       # PNG bytes to transmit (b"" = no art for this song)
         self.loaded = False       # an image is transmitted
         self.placed_at = None     # (row, col) where it's placed
         self.lock = threading.Lock()  # key and pending change together (fetch threads vs. draw)
+        self.http = None          # keeps the connection to the image servers open between songs
 
     def want(self, key, url):
         if not self.enabled or key == self.key:
@@ -1355,8 +1404,14 @@ class AlbumArt:
     def _fetch(self, key, url):
         url = re.sub(r"=w\d+-h\d+", "=w400-h400", url)  # ask for a larger googleusercontent image
         try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = resp.read()
+            import requests
+            from PIL import Image
+            with self.lock:
+                if self.http is None:
+                    self.http = requests.Session()
+            resp = self.http.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.content
             img = Image.open(io.BytesIO(data)).convert("RGB")
             if "ytimg.com" in url:  # hq/sd video thumbnails are 4:3 with black bars above and below
                 box = img.convert("L").point(lambda v: 255 if v > 24 else 0).getbbox()
@@ -1366,7 +1421,7 @@ class AlbumArt:
             left, top = (img.width - side) // 2, (img.height - side) // 2
             img = img.crop((left, top, left + side, top + side)).resize((320, 320))
             out = io.BytesIO()
-            img.save(out, "PNG")
+            img.save(out, "PNG", compress_level=1)  # 3x faster than the default, only ~7% bigger
             png = out.getvalue()
         except Exception:  # network and image decoding errors: just show no art
             png = b""
@@ -1605,6 +1660,8 @@ class Screen:
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.last_draw = 0.0
         self.drawn = {}             # screen row -> (col, text) last sent, to skip unchanged rows
+        self.header_due = 0.0       # when the cached header/footer must be rebuilt (see draw)
+        self.chrome = ([], [], [])  # cached (header lines, footer lines, header click regions)
         self.full_bar = "█" * BAR_W
         self.empty_bar = " " * BAR_W
         self.part_bars = [c * BAR_W for c in PARTIAL]
@@ -1618,6 +1675,10 @@ class Screen:
             return
         while self.state.source != "app":
             time.sleep(1)
+        try:
+            self.lib.yt()  # waits for the warm-up: whether we're signed in decides what to load
+        except Exception:
+            pass
         jobs = [("home", self.lib.home)]
         if self.lib.logged_in:
             jobs += [("liked", self.lib.liked), ("playlists", self.lib.playlists)]
@@ -1644,15 +1705,18 @@ class Screen:
         if (self.nbars, self.bar_h) != self.cava_dims:  # only restart cava when the bars changed
             self.start_cava()
         self.levels = (self.levels + [0] * self.nbars)[:self.nbars]
-        top = self.bar_h * 8  # level -> cell text, per row (levels above `top` look the same as `top`)
-        self.bar_cells = [[self.full_bar if b < v >> 3 else self.part_bars[v & 7] if b == v >> 3 else self.empty_bar
-                           for v in range(top + 1)] for b in range(self.bar_h)]
-        self.reflect_cells = [[self.reflect_bar if b < v >> 3 else self.empty_bar for v in range(top + 1)]
-                              for b in range(self.reflect_h)]
+        # level -> the cells of one bar, top row first, then the reflection rows (levels above `top`
+        # look the same as `top`); bars() zips these columns into screen rows
+        top = self.bar_h * 8
+        self.bar_columns = [tuple(self.full_bar if b < v >> 3 else self.part_bars[v & 7] if b == v >> 3
+                                  else self.empty_bar for b in range(self.bar_h - 1, -1, -1))
+                            + tuple(self.reflect_bar if b < v >> 3 else self.empty_bar for b in range(self.reflect_h))
+                            for v in range(top + 1)]
         # not ESC[2J: Ghostty's ED 2 also deletes all kitty images, data included, so i=7 could
         # no longer be placed; home + erase-below clears the same cells and keeps the image data
         sys.stdout.write(ESC + "H" + ESC + "J")
         self.drawn = {}
+        self.header_due = 0.0
         self.art.forget_placement()
 
     def start_cava(self):
@@ -1719,6 +1783,7 @@ class Screen:
         notice = st.current_notice()
         if notice:
             left = [(fit(notice, left_w), fg(GOLD), None)]
+            self.header_due = min(self.header_due, st.notice_until)  # gone right when it expires
         elif st.job:
             job = st.job
             count = f" {job['done']}/{job['total']}" if job["total"] > 1 else ""
@@ -1793,7 +1858,9 @@ class Screen:
         loop = title + "    ✦    "
         scroll = len(loop) / 4  # seconds to scroll one full loop at 4 characters per second
         t = (time.time() - self.title_since) % (2.5 + scroll)  # pause 2.5 s at the start of every loop
-        offset = int(max(t - 2.5, 0) * 4) % len(loop)
+        step = int(max(t - 2.5, 0) * 4)
+        offset = step % len(loop)
+        self.header_due = min(self.header_due, time.time() + 2.5 + (step + 1) / 4 - t)  # the next step
         return fit((loop + loop)[offset:], w, ellipsis=False)
 
     def progress_bar(self, x0, w):
@@ -1809,6 +1876,9 @@ class Screen:
         done = round(frac * (track_w - 1))
         self.track = (PROGRESS_ROW + 1, x0 + len(left) + 1, track_w) if length else None
         knob = "◆" if self.drag_frac is not None else "●"
+        if st.playing and length and self.drag_frac is None:  # rebuild when the time or the knob moves on
+            ahead = min(int(pos) + 1, (done + 0.5) / max(track_w - 1, 1) * length) - pos
+            self.header_due = min(self.header_due, time.time() + max(ahead, 0))
         return fg(CYAN) + left + " " + track_bar(track_w, done, knob) + " " + fg(PINK) + right + RESET
 
     def buttons(self):
@@ -1828,6 +1898,8 @@ class Screen:
         out = " " * (col - 1)
         for (text, action), lb in zip(specs, labels):
             down = held == action and time.time() < until
+            if down:
+                self.header_due = min(self.header_due, until)  # release the highlight on time
             out += bg(BUTTON_PRESSED if down else BUTTON_BG) + fg(PINK if action != "toggle" else CYAN, True)
             out += lb + RESET + (" " * gap if action != "next" else "")
             self.hits.append((row, col, col + cells(lb) - 1, lambda a=action: self.press(a)))
@@ -1844,15 +1916,10 @@ class Screen:
         pad_ = " " * MARGIN
         top = self.bar_h * 8
         vals = [min(v, top) for v in (self.levels + [0] * self.nbars)[:self.nbars]]
-        gap = " " * BAR_GAP
-        lines = []
-        for b in range(self.bar_h - 1, -1, -1):  # top row first
-            row = gap.join(map(self.bar_cells[b].__getitem__, vals))
-            lines.append((1, pad_ + self.row_colors[b] + row + RESET))
-        lines.append((1, fg(PINK, True) + "━" * self.cols + RESET))  # horizon
-        for b in range(self.reflect_h):  # mirrored, fading reflection
-            row = gap.join(map(self.reflect_cells[b].__getitem__, vals))
-            lines.append((1, pad_ + self.reflect_colors[b] + row + RESET))
+        rows = map((" " * BAR_GAP).join, zip(*map(self.bar_columns.__getitem__, vals)))  # bars top row first
+        colors = self.row_colors[::-1] + self.reflect_colors  # then the mirrored, fading reflection
+        lines = [(1, pad_ + color + row + RESET) for color, row in zip(colors, rows)]
+        lines.insert(self.bar_h, (1, fg(PINK, True) + "━" * self.cols + RESET))  # horizon
         for i in range(len(lines)):  # clicking anywhere on the visualizer plays/pauses
             self.hits.append((HEADER_ROWS + i + 1, 1, self.cols, lambda: self.press("toggle")))
         return lines
@@ -2340,14 +2407,22 @@ class Screen:
         return [(1, ""), (1, " " * MARGIN + "  ".join(out) + RESET)]
 
     def draw(self):
-        self.hits = []
         st = self.state
         if self.art_on:
             self.art.want((st.video_id, st.image), st.image)
-        header = self.header()
+        now = time.time()
+        if now >= self.header_due:
+            # header and footer only change with input (step resets header_due), the clock (marquee,
+            # time bar, button flash and notices lower it) or the state, which shows within 0.1 s; cava
+            # frames in between reuse them, with their click regions
+            self.header_due, self.hits = now + 0.1, []
+            header = self.header()
+            self.chrome = (header, self.footer(), self.hits)
+        header, footer, hits = self.chrome
+        self.hits = list(hits)
         prompt = self.prompt()
         body = self.prompt_lines(prompt) if prompt else self.panel_lines() if self.stack else self.bars()
-        lines = (header + body + self.footer())[:self.rows]
+        lines = (header + body + footer)[:self.rows]
         out = []
         for i, line in enumerate(lines):
             if self.drawn.get(i) == line:
@@ -2447,7 +2522,7 @@ class Screen:
         if self.resize_at and now - self.resize_at > 0.15:  # debounce window drags
             self.layout()
         fds = [stdin] + ([self.cava.fd] if self.cava else [])
-        timeout = 0.03 if self.inbuf else 0.1
+        timeout = 0.03 if self.inbuf else 0.1 if self.last_draw else 0  # first frame right away
         ready, _, _ = select.select(fds, [], [], timeout)
         redraw = False
         if stdin in ready:
@@ -2457,6 +2532,7 @@ class Screen:
             self.inbuf += self.decoder.decode(data)
         for k in self.take_keys():
             redraw = True
+            self.header_due = 0.0  # keys and clicks can change anything in the header
             if not self.key(k):
                 return False
         if self.restart:
@@ -2464,12 +2540,13 @@ class Screen:
         if self.cava and self.cava.fd in ready:
             frame = self.cava.latest_frame()
             if frame is not None:
-                self.levels = frame
-                redraw = redraw or not self.stack  # bars are hidden behind panels
+                if frame != self.levels:  # silence and paused songs repeat the same frame: nothing to draw
+                    self.levels = frame
+                    redraw = redraw or not self.stack  # bars are hidden behind panels
             elif self.cava.proc.poll() is not None:
                 self.cava = None
                 self.state.notify("The visualizer stopped (cava exited)")
-        if redraw or time.time() - self.last_draw > 0.1:  # 10 fps is plenty without bars
+        if redraw or time.time() >= self.header_due:  # at least 10 fps without bars (see draw)
             self.draw()
         return True
 
