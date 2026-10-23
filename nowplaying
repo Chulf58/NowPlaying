@@ -56,7 +56,7 @@ import urllib.error
 import urllib.request
 
 # Bump on every release: running copies offer to update when GitHub has a higher number
-VERSION = "1.3"
+VERSION = "1.4"
 REPO = "Chulf58/NowPlaying"
 
 # Bottom -> top gradient for the bars (same palette as ~/.config/cava/config)
@@ -923,13 +923,23 @@ class State:
         """Play the queue item at `index` and make sure that song really started."""
         for _ in range(3):
             check()
+            was = (self.api.request("GET", "/api/v1/song") or {}).get("videoId")
             self.api.request("PATCH", "/api/v1/queue", {"index": index})
-            deadline = time.time() + 3
+            deadline, polls = time.time() + 3, 0
             while time.time() < deadline:
                 time.sleep(0.1)
                 check()
-                if (self.api.request("GET", "/api/v1/song") or {}).get("videoId") == video_id:
+                now = (self.api.request("GET", "/api/v1/song") or {}).get("videoId")
+                if now == video_id:
                     return True
+                polls += 1
+                if (now and now != was) or polls % 5 == 0:
+                    # Some songs play under another videoId (the music video of a track, say), so
+                    # trust the queue: our item being the selected one means it started.
+                    snapshot = self.api.queue()
+                    if any(q["current"] and q["index"] == index and q["videoId"] == video_id for q in snapshot):
+                        return True
+                    was = now
             found = [q["index"] for q in self.api.queue() if q["videoId"] == video_id]
             if not found:
                 return False
@@ -948,6 +958,7 @@ class State:
             self.pending = None
             self.notify("YouTube Music didn't start the song, try again")
             return False
+        self.pending = None  # it plays (perhaps under another videoId, which pending_song can't match)
         return True
 
     def set_pending(self, item):
@@ -969,37 +980,80 @@ class State:
                 self.notify(f"Playing {title}")
         self.submit(job, replace=True)
 
-    def play_list(self, label, fetch, limit=200):
+    AHEAD = 10  # songs lined up after the new one before the old queue goes (see play_list)
+
+    def play_list(self, label, fetch, limit=200, first=None):
         """Replace the queue with a list of songs and play the first one.
 
-        `fetch` returns the videoIds (it may take a moment, e.g. building a radio).
+        `fetch` returns the videoIds (it may take a moment, e.g. building a radio). When the first
+        song is known up front (`first`), it starts while `fetch` is still running.
         """
         def job(check):
             self.job = {"label": label, "done": 0, "total": 0}
-            ids = [v for v in fetch() if v][:limit]
-            check()
+            got = {}
+
+            def load():
+                try:
+                    got["ids"] = [v for v in fetch() if v][:limit]
+                except Exception as e:
+                    got["error"] = e
+            loader = threading.Thread(target=load, daemon=True)
+            loader.start()
+            # When nothing follows the playing song, the app fills the queue with its own autoplay
+            # songs (one song repeated over and over). If the old queue goes on after the playing
+            # song, that can't happen yet, so the picked song can start right away.
+            snapshot = self.api.queue()
+            cur = next((q for q in snapshot if q["current"]), None)
+            started = False
+            if first and cur and any(q["index"] > cur["index"] for q in snapshot):
+                if not self._start(first, check, snapshot):
+                    return
+                started = True
+                self.job["done"] = 1
+            while loader.is_alive():
+                loader.join(0.1)
+                check()
+            if "error" in got:
+                raise got["error"]
+            ids = got["ids"]
+            if started and ids[:1] != [first]:
+                ids = [first] + [v for v in ids if v != first][:limit - 1]
             if not ids:
                 self.notify("Nothing to play")
                 return
             self.job["total"] = len(ids)
-            # Queue the second song first, so it follows the first one right away: when nothing
-            # follows the playing song, the app fills the queue with its own autoplay songs.
-            before = None
-            if len(ids) > 1:
-                index, before = self._add_and_wait(ids[1], "INSERT_AFTER_CURRENT_VIDEO", self.api.queue(), check,
-                                                   fast=True)
-                before = before if index is not None else None
-            if not self._start(ids[0], check, before):
-                return
-            self.job["done"] = min(len(ids), 2)
+            if started:
+                # Line up a few songs after the new one before deleting the old queue, so the app
+                # never sees the playing song as (nearly) the last one and loads its autoplay.
+                ahead = ids[1:self.AHEAD]
+                snapshot = None
+                for vid in reversed(ahead):  # each insert lands right after the current song
+                    check()
+                    _, snapshot = self._add_and_wait(vid, "INSERT_AFTER_CURRENT_VIDEO",
+                                                     snapshot or self.api.queue(), check)
+                    self.job["done"] += 1
+                kept = 1 + len(ahead)
+            else:
+                # Queue the second song first, so it follows the first one right away.
+                before = None
+                if len(ids) > 1:
+                    index, before = self._add_and_wait(ids[1], "INSERT_AFTER_CURRENT_VIDEO", snapshot, check,
+                                                       fast=True)
+                    before = before if index is not None else None
+                if not self._start(ids[0], check, before):
+                    return
+                self.job["done"] = kept = min(len(ids), 2)
             self._refresh_extras()  # show "up next" as soon as there is one
             before = self.api.queue()
             if any(q["current"] and q["videoId"] == ids[0] for q in before):
-                before = self._remove_others(ids[:2], check, before)
-            for vid in ids[2:]:
+                before = self._remove_others(ids[:kept], check, before)
+            wanted = set(ids)
+            for vid in ids[kept:]:
                 check()
                 _, before = self._add_and_wait(vid, "INSERT_AT_END", before, check, timeout=6)
                 self.job["done"] += 1
+                if any(not q["current"] and q["videoId"] not in wanted for q in before):
+                    before = self._remove_others(ids, check, before)  # the app's autoplay got in anyway
             self._remove_others(ids, check)  # autoplay songs the app added while we were busy
         self.submit(job, replace=True)
 
@@ -1008,9 +1062,14 @@ class State:
         Returns the queue as it is now, without asking the app again."""
         snapshot = self.api.queue() if snapshot is None else snapshot
         want = collections.Counter(ids)
+        for q in snapshot:  # the playing copy counts first, not an old copy further down
+            if q["current"]:
+                want[q["videoId"]] -= 1
         drop = []
         for q in reversed(snapshot):
-            if q["current"] or want[q["videoId"]] > 0:
+            if q["current"]:
+                continue
+            if want[q["videoId"]] > 0:
                 want[q["videoId"]] -= 1
             else:
                 drop.append(q["index"])
@@ -2133,10 +2192,10 @@ class Screen:
             if v["tracklist"]:
                 ids = self.song_ids(items, index)
                 label = f"Playing {item['title']}" + (f" + {len(ids) - 1} more" if len(ids) > 1 else "")
-                st.play_list(label, lambda: ids)
+                st.play_list(label, lambda: ids, first=ids[0] if ids else None)
             elif lib.available:  # a lone song starts a radio, like YouTube Music does
                 st.play_list(f"Playing {item['title']} + similar songs",
-                             lambda: lib.radio_ids(item["videoId"]))
+                             lambda: lib.radio_ids(item["videoId"]), first=item["videoId"])
             else:
                 st.play_now(item["videoId"], item["title"])
             self.stack = []
@@ -2156,7 +2215,8 @@ class Screen:
             return
         self.state.set_pending(item)
         self.state.play_list(f"Radio from {item['title']}",
-                             lambda: [s["videoId"] for s in self.lib.radio(item["videoId"])])
+                             lambda: [s["videoId"] for s in self.lib.radio(item["videoId"])],
+                             first=item["videoId"])
         self.stack = []
 
     def hint(self, v):
